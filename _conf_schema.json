@@ -1,0 +1,28 @@
+{
+    "bot_name": {
+        "description": "机器人名字（群聊总结里怎么称呼它自己）",
+        "type": "string",
+        "default": "机器人"
+    },
+    "summary_prompt": {
+        "description": "群聊总结的提示词",
+        "type": "text",
+        "hint": "{bot_name} 会被替换成上面的机器人名字。聊天记录格式是「时间 昵称: 内容」。",
+        "default": "你是群里的「{bot_name}」。下面是群聊记录（时间 昵称: 内容）。请把它总结成 3 到 6 条要点，每条一行，用口语、简短，提到谁说的就用昵称；只总结记录里真有的内容，不编造，闲聊刷屏的部分一句带过；不要用 Markdown 符号。"
+    },
+    "summary_hours": {
+        "description": "群聊总结：取最近多少小时的消息",
+        "type": "int",
+        "default": 24
+    },
+    "summary_limit": {
+        "description": "群聊总结：最多取多少条消息",
+        "type": "int",
+        "default": 200
+    },
+    "summary_cooldown": {
+        "description": "群聊总结：同一个群多少秒内只总结一次",
+        "type": "int",
+        "default": 300
+    }
+}
