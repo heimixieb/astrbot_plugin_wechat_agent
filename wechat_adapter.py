@@ -566,16 +566,11 @@ class WeChatAgentAdapter(Platform):
             buf.clear()
             if not text:
                 return
-            fix = None
-            if reply_message_id:  # 只给回复别人的话加错字，工具/主动推送的内容不动
-                text, fix = make_typo(text)
             if first_text:
                 first_text = False
                 await self._paced(lambda: self._send_text(thread_id, text, quote_comp, mention_ids, mention_all))
             else:
                 await self._paced(lambda: self._send_text(thread_id, text, None, [], False))
-            if fix:
-                await self._paced(lambda: self._send_text(thread_id, f"*{fix}", None, [], False))
 
         for comp in comps:
             if isinstance(comp, (Reply, At, AtAll)):
@@ -690,33 +685,6 @@ def quote_probability(text_length: int, previous_self: bool, previous_seconds: f
         p = 0.2093 if text_length <= 50 else 0.0861
     mult = 0.5 if distance == 0 else 1.0 if distance <= 2 else 1.1 if distance <= 5 else 1.5
     return min(1.0, p * mult)
-
-
-# 打错字：照搬 MaiBot chinese_typo 的做法——每个汉字 1% 概率出错，出错后一半会补发一条更正。
-# shortcut: 用常见同音字表代替 MaiBot 的拼音+字频库（不加新依赖），只有表里的字会被打错。
-TYPO_CHAR_RATE = 0.01
-_HOMOPHONES = {
-    "的": "得地", "得": "的地", "地": "的得", "在": "再", "再": "在", "做": "作", "作": "做",
-    "已": "以", "以": "已", "那": "哪", "哪": "那", "像": "象", "象": "像", "会": "回", "回": "会",
-    "就": "旧", "到": "道", "道": "到", "吗": "嘛", "嘛": "吗", "他": "她", "她": "他", "是": "事",
-    "事": "是", "带": "戴", "戴": "带", "坐": "座", "座": "坐", "期": "其", "其": "期", "题": "提",
-    "提": "题", "意": "义", "嗯": "恩", "恩": "嗯", "辛": "心", "心": "新", "新": "心", "又": "有", "有": "又",
-}
-
-
-def make_typo(text: str) -> tuple[str, str | None]:
-    """返回 (可能带一个错字的文本, 需要补发更正的正确字或 None)。"""
-    if len(text) < 5 or any(m in text for m in ("http", "www.", "`", "[", "]", "{", "}", "@")):
-        return text, None
-    han = [(i, c) for i, c in enumerate(text) if "一" <= c <= "鿿"]
-    if len(han) < 3 or random.random() >= 1 - (1 - TYPO_CHAR_RATE) ** len(han):
-        return text, None
-    cands = [(i, c) for i, c in han if c in _HOMOPHONES]
-    if not cands:
-        return text, None
-    i, c = random.choice(cands)
-    typo = random.choice(_HOMOPHONES[c])
-    return text[:i] + typo + text[i + 1:], (c if random.random() < 0.5 else None)
 
 
 def _link_text(link: dict | None) -> str:

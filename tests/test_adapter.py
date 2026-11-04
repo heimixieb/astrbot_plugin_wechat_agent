@@ -430,24 +430,12 @@ class QuoteProbabilityTest(Base):
         self.assertTrue(all("quote" not in s for s in self.d.sends))
 
 
-class TypoTest(Base):
-    def test_make_typo_replaces_one_char_and_suggests_fix(self):
+class NoTypoTest(Base):
+    async def test_reply_sent_as_is(self):
         from unittest.mock import patch
-        from astrbot_plugin_wechat_agent.wechat_adapter import make_typo
-        with patch("astrbot_plugin_wechat_agent.wechat_adapter.random.random", return_value=0.0), \
-             patch("astrbot_plugin_wechat_agent.wechat_adapter.random.choice", side_effect=lambda s: s[0]):
-            self.assertEqual(make_typo("我在家的时候"), ("我再家的时候", "在"))
-        with patch("astrbot_plugin_wechat_agent.wechat_adapter.random.random", return_value=0.99):
-            self.assertEqual(make_typo("我在家的时候"), ("我在家的时候", None))  # 大多数时候不出错
-        self.assertEqual(make_typo("看 http://a.cn 在的"), ("看 http://a.cn 在的", None))
-
-    async def test_reply_typo_then_correction(self):
-        from unittest.mock import patch
-        with patch("astrbot_plugin_wechat_agent.wechat_adapter.random.random", return_value=0.0), \
-             patch("astrbot_plugin_wechat_agent.wechat_adapter.random.choice", side_effect=lambda s: s[0]):
+        with patch("astrbot_plugin_wechat_agent.wechat_adapter.random.random", return_value=0.0):
             await self.a.send_chain(OWNER, MessageChain([Plain("我在家的时候")]), reply_message_id="p9")
-            await self.a.send_chain(OWNER, MessageChain([Plain("我在家的时候")]))  # 不是回复：不加错字
-        self.assertEqual([s["text"] for s in self.d.sends], ["我再家的时候", "*在", "我在家的时候"])
+        self.assertEqual([s["text"] for s in self.d.sends], ["我在家的时候"])  # 打错字功能已去掉，原样发
 
 
 class AvatarTest(Base):

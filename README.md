@@ -16,7 +16,7 @@
 | 发合并转发 | 微信没有合并转发，自动拆成普通消息按顺序发 |
 | 群昵称 / 头像 | 优先用群昵称；`WeChatClient.avatar(wxid)` 可取联系人头像 |
 | 防风控 | 所有发送串行，条间随机间隔 2~4 秒、每分钟最多 12 条，等守护进程真正发出再发下一条 |
-| 拟人 | 偶尔打一个同音错字并补发更正；群聊引用按概率决定 |
+| 拟人 | 群聊引用按概率决定 |
 | 旧消息保护 | 机器人停机很久再恢复时，超过 5 分钟的旧消息不再回复 |
 | **语音通话** | 白名单里的人给机器人打微信语音，自动接听，接到 [豆包端到端实时语音](https://docs.volcengine.com/docs/doubao-voice/end-to-end-real-time-voice-full-duplex-version?lang=zh)（全双工），可打断 |
 | **群聊总结** | 群里发 `/总结群聊`，总结最近 24 小时的群聊 |
@@ -85,7 +85,7 @@ PYTHONPATH=/path/to/AstrBot:. python -m pytest -q astrbot_plugin_wechat_agent/te
 ## 致谢
 
 - [agent-wechat](https://github.com/thisnick/agent-wechat)（MIT）：本插件对接的微信守护进程。
-- [MaiBot](https://github.com/Mai-with-u/MaiBot)（GPL-3.0）：群聊引用概率、打错字补更正的思路和参数参考了 MaiBot。
+- [MaiBot](https://github.com/Mai-with-u/MaiBot)（GPL-3.0）：群聊引用概率的思路和参数参考了 MaiBot。
 
 ## 许可证
 
