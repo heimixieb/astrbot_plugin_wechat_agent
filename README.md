@@ -54,7 +54,8 @@
 | `max_message_age_seconds` | `300` | 超过这个秒数的旧消息不处理，`0` 不限 |
 | `call_enable` | `false` | 是否接听微信语音来电 |
 | `call_allow` | `[]` | 允许接听的来电 wxid，其他人自动拒接 |
-| `call_voice` | `zh_female_xiaohe_jupiter_bigtts` | 豆包音色（小何 2.0） |
+| `call_voice` | `zh_female_xiaohe_jupiter_bigtts` | 豆包音色（小何 2.0），也可以填自己复刻的 `S_` 开头音色 |
+| `call_speech_rate` | `0` | 电话语速，-50~100，`0` 正常，`100` 是 2 倍速 |
 | `call_greeting` | `喂？你好呀～` | 接通后说的第一句话 |
 | `call_prompt_file` | 空 | 电话里用的人设文件，留空用插件自带的 `call_prompt.md` |
 | `call_max_minutes` | `10` | 单次通话最长分钟数，到时自动挂断 |

@@ -69,6 +69,7 @@ DEFAULT_CONFIG = {
     "call_enable": False,  # 微信语音来电 → 豆包实时语音（需守护进程 ≥1.4.0、环境变量 DOUBAO_REALTIME_API_KEY）
     "call_allow": [],  # 允许接听的来电 wxid
     "call_voice": "zh_female_xiaohe_jupiter_bigtts",
+    "call_speech_rate": 0,  # 电话语速 -50~100，0 正常，100 = 2 倍速
     "call_greeting": "喂？你好呀～",
     "call_prompt_file": "",  # 电话里用的人设文件；留空 = 插件自带的 call_prompt.md
     "max_message_age_seconds": 300,  # 停机恢复后补到的旧消息超过这个秒数就不处理（0 = 不限）

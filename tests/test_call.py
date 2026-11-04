@@ -121,6 +121,7 @@ class CallBridgeTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.f.speech_up.wait(), 5)  # 对方的声音到了豆包
         create = next(e for e in self.f.llm_in if e["type"] == "session.create")["session"]
         self.assertEqual(create["audio"]["output"]["voice"], "zh_female_xiaohe_jupiter_bigtts")
+        self.assertEqual(create["audio"]["output"]["speech_rate"], 0)
         self.assertIn("打微信语音电话", create["instructions"])
         self.assertEqual(self.f.media_json[0], {"type": "audio.start", "generation": 1})
         self.assertAlmostEqual(len(self.f.media_in), 3200, delta=8)  # 24k 100ms → 16k 100ms

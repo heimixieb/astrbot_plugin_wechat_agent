@@ -40,6 +40,7 @@ class CallBridge:
         self.client = client  # WeChatClient（复用 base_url / token / account_id）
         self.allow = {str(x) for x in (cfg.get("call_allow") or [])}
         self.voice = str(cfg.get("call_voice") or "zh_female_xiaohe_jupiter_bigtts")
+        self.speech_rate = int(cfg.get("call_speech_rate", 0))  # 豆包 speech_rate：-50~100，0 正常，100 = 2 倍速
         self.greeting = str(cfg.get("call_greeting") or "喂？你好呀～")
         self.prompt_file = Path(str(cfg.get("call_prompt_file") or "") or PROMPT_FILE)
         self.max_seconds = float(cfg.get("call_max_minutes", 10)) * 60
@@ -166,7 +167,8 @@ class CallBridge:
                     "model": "1.2.6.1",
                     "instructions": self.prompt_file.read_text(encoding="utf-8") if self.prompt_file.exists() else "",
                     "audio": {"input": {"format": {"type": "pcm", "rate": 16000}},
-                              "output": {"format": {"type": "pcm_s16le", "rate": 24000}, "voice": self.voice}}}})
+                              "output": {"format": {"type": "pcm_s16le", "rate": 24000}, "voice": self.voice,
+                                         "speech_rate": self.speech_rate}}}})
                 logger.info("[wechat_call] 通话已接通，豆包会话建立中")
                 uplink = bytearray()
                 tasks = [
