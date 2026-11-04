@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Plain
 
@@ -20,6 +21,10 @@ class WeChatAgentMessageEvent(AstrMessageEvent):
 
     async def send(self, message: MessageChain) -> None:
         if not message or not message.chain:
+            return
+        raw = self.message_obj.raw_message if isinstance(self.message_obj.raw_message, dict) else {}
+        if self.platform.is_recalled(self.native_message_id, raw.get("serverId")):
+            logger.info(f"[wechat_agent] 对方已撤回 {self.native_message_id[:24]}，这条回复不发了")
             return
         await self.platform.send_chain(
             self.native_thread_id, message, reply_message_id=self.native_message_id

@@ -20,7 +20,7 @@ astrbot_config["trace_enable"] = False
 
 from astrbot_plugin_wechat_agent.wechat_adapter import WeChatAgentAdapter
 from astrbot_plugin_wechat_agent.wechat_client import WeChatApiError, WeChatClient
-from astrbot_plugin_wechat_agent.wechat_media import prepare_image_bytes
+from astrbot_plugin_wechat_agent.wechat_media import pick_cuts, prepare_image_bytes
 from astrbot_plugin_wechat_agent.tests.fake_daemon import ACC, TOKEN, FakeDaemon, committed, msg
 
 OWNER = "wxid_owner"
@@ -157,6 +157,27 @@ class InboundTests(Base):
         abm = await self.feed(msg("m11", OWNER, OWNER, 3))  # 没有 assets
         self.assertIn("下载失败", abm.message_str)
 
+    async def test_link_card_becomes_text_with_url_line(self):
+        link = {"title": "猫猫视频", "description": "超可爱", "url": "https://b23.tv/abc", "sourceName": "哔哩哔哩"}
+        abm = await self.feed(msg("m12", OWNER, OWNER, 49, "猫猫视频", appMessageType=5, link=link))
+        self.assertEqual(abm.message_str, "[分享] 猫猫视频 （哔哩哔哩）\n超可爱\nhttps://b23.tv/abc")
+        self.assertIn("https://b23.tv/abc", abm.message_str.splitlines())  # 网址单独一行
+
+    async def test_forwarded_chat_becomes_text(self):
+        abm = await self.feed(msg("m13", OWNER, OWNER, 49, "Alice: 吃了吗\nBob: 没", appMessageType=19))
+        self.assertEqual(abm.message_str, "[聊天记录]\nAlice: 吃了吗\nBob: 没")
+
+    async def test_quote_of_link_card_keeps_link(self):
+        m = msg("m14", OWNER, OWNER, 49, "这个好看", appMessageType=57,
+                quote={"serverId": "8", "type": 49, "senderId": "wxid_bob",
+                       "embeddedLink": {"title": "文章", "url": "https://mp.weixin.qq.com/s/x"}})
+        rep = next(c for c in (await self.feed(m)).message if isinstance(c, Reply))
+        self.assertIn("https://mp.weixin.qq.com/s/x", rep.message_str)
+
+    async def test_already_recalled_message_ignored(self):
+        m = msg("m15", OWNER, OWNER, 1, "[Message recalled]", recall={"observedAt": "2026-11-04T00:00:00Z"})
+        self.assertIsNone(await self.feed(m))
+
 
 class OutboundTests(Base):
     async def test_text_private(self):
@@ -209,6 +230,25 @@ class OutboundTests(Base):
         self.assertEqual(s["kind"], "voice")
         self.assertTrue(900 <= s["durationMs"] <= 1100, s)
         self.assertEqual(self.d.uploads[0]["ctype"], "audio/wav")
+
+    async def test_long_voice_split_under_limit(self):
+        p = os.path.join(self.tmp, "long.wav")
+        open(p, "wb").write(wav_bytes(130.0))
+        await self.a.send_chain(OWNER, MessageChain([Record.fromFileSystem(p)]))
+        durs = [s["durationMs"] for s in self.d.sends]
+        self.assertEqual([s["kind"] for s in self.d.sends], ["voice"] * 3, durs)
+        self.assertTrue(all(d <= 55_500 for d in durs), durs)
+        self.assertTrue(129_000 <= sum(durs) <= 131_000, durs)
+        self.assertFalse([f for f in os.listdir(self.tmp) if "_part" in f])  # 切出来的临时文件删掉了
+
+    def test_pick_cuts_prefers_breath_pause(self):
+        r = lambda xs: [round(x, 3) for x in xs]  # noqa: E731
+        self.assertEqual(pick_cuts(50, []), [])
+        self.assertEqual(r(pick_cuts(70, [(40.0, 40.6)])), [40.3])  # 切在停顿中点
+        self.assertEqual(r(pick_cuts(70, [(10.0, 10.5)])), [55.0])  # 停顿太靠前：硬切
+        cuts = pick_cuts(200, [(50.0, 51.0), (100.0, 100.4)])
+        self.assertEqual(r(cuts[:2]), [50.5, 100.2])
+        self.assertTrue(all(b - a <= 55 for a, b in zip([0, *cuts], [*cuts, 200])))
 
     async def test_mixed_order(self):
         p = os.path.join(self.tmp, "x.gif")
@@ -444,3 +484,21 @@ class StaleMessageTest(Base):
 
     async def test_fresh_message_is_handled(self):
         self.assertIsNotNone(await self.feed(msg("new1", OWNER, OWNER, 1, "刚说的话")))
+
+
+class RecallTest(Base):
+    async def test_recalled_before_reply_is_not_sent(self):
+        await self.feed(msg("r1", OWNER, OWNER, 1, "发错了", serverId="4242"))
+        ev = self.queue.get_nowait()
+        await self.a.handle_event({"cursor": "2", "kind": "message.recalled",
+                                   "data": {"threadId": OWNER, "serverId": "4242"}})
+        await ev.send(MessageChain([Plain("收到")]))
+        self.assertEqual(self.d.sends, [])
+
+    async def test_not_recalled_is_sent(self):
+        await self.feed(msg("r2", OWNER, OWNER, 1, "在吗", serverId="4343"))
+        ev = self.queue.get_nowait()
+        await self.a.handle_event({"cursor": "2", "kind": "message.recalled",
+                                   "data": {"threadId": OWNER, "messageId": "other", "serverId": "1"}})
+        await ev.send(MessageChain([Plain("在")]))
+        self.assertEqual(self.d.sends[0]["text"], "在")

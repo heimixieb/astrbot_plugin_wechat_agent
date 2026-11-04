@@ -1,4 +1,4 @@
-"""出站媒体预处理：GIF/动图 -> 静态 PNG 首帧；音频时长。"""
+"""出站媒体预处理：GIF/动图 -> 静态 PNG 首帧；音频时长；长语音切段。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import io
 import mimetypes
 import os
+import re
 import tempfile
 
 
@@ -49,6 +50,60 @@ async def audio_duration_ms(path: str) -> int | None:
         return max(1, int(val * 1000))
     except Exception:
         return None
+
+
+VOICE_MAX_SECONDS = 55.0  # 微信语音最长 60 秒，留点余量
+_SILENCE = re.compile(r"silence_(start|end): (-?[\d.]+)")
+
+
+def pick_cuts(total: float, silences: list[tuple[float, float]], limit: float = VOICE_MAX_SECONDS) -> list[float]:
+    """长语音的切点：每段不超过 limit 秒，尽量切在换气的静音里（取静音中点）；后半段找不到静音就硬切。"""
+    cuts: list[float] = []
+    start = 0.0
+    while total - start > limit:
+        lo, hi = start + limit / 2, start + limit
+        hits = [(s, e) for s, e in silences if s < hi and e > lo]
+        cut = min(max((hits[-1][0] + hits[-1][1]) / 2, lo), hi) if hits else hi
+        cuts.append(cut)
+        start = cut
+    return cuts
+
+
+async def split_voice(path: str, total_ms: int) -> list[str]:
+    """把超过 VOICE_MAX_SECONDS 的音频按换气停顿切成几段 wav；失败返回 []。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-nostats", "-i", path, "-af", "silencedetect=noise=-35dB:d=0.3", "-f", "null", "-",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), 60)
+        marks = [(k, float(v)) for k, v in _SILENCE.findall(err.decode(errors="ignore"))]
+        silences, open_at = [], None
+        for k, v in marks:
+            if k == "start":
+                open_at = v
+            elif open_at is not None:
+                silences.append((open_at, v))
+                open_at = None
+        total = total_ms / 1000
+        if open_at is not None:
+            silences.append((open_at, total))
+        bounds = [0.0, *pick_cuts(total, silences), total]
+        parts = []
+        for i, (a, b) in enumerate(zip(bounds, bounds[1:])):
+            out = f"{os.path.splitext(path)[0]}_part{i + 1}.wav"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-loglevel", "error", "-i", path, "-ss", f"{a:.3f}", "-to", f"{b:.3f}",
+                "-ar", "16000", "-ac", "1", out,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), 60)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg cut failed at part {i + 1}")
+            parts.append(out)
+        return parts
+    except Exception:
+        return []
 
 
 async def to_wav(path: str) -> str | None:

@@ -46,10 +46,12 @@ from astrbot.core.platform.platform import PlatformStatus
 from .wechat_call import CallBridge
 from .wechat_client import SUCCESS_JOB_STATES, WeChatApiError, WeChatClient
 from .wechat_event import WeChatAgentMessageEvent
-from .wechat_media import audio_duration_ms, prepare_image_bytes, to_wav
+from .wechat_media import VOICE_MAX_SECONDS, audio_duration_ms, prepare_image_bytes, split_voice, to_wav
 
 ADAPTER_NAME = "wechat_agent"
 SUPPORTED_TYPES = {1, 3, 34, 47, 49}
+# 49 类应用消息里按文字处理的：分享文字(1)、聊天记录合并转发(19)、引用回复(57)、群公告(87)；带 link 的卡片另算
+APP_TEXT_TYPES = {1, 19, 57, 87, None}
 _MENTION_PREFIX = re.compile(r"^(?:@[^\s\u2005\u00a0]+[\u2005\u00a0 ]+)+")
 
 DEFAULT_CONFIG = {
@@ -122,6 +124,8 @@ class WeChatAgentAdapter(Platform):
         # 群聊引用概率用：每个群最近的发言 (消息id, 是否自己, 时间)，以及已决定过是否引用的目标消息
         self._thread_log: dict[str, deque[tuple[str, bool, float]]] = {}
         self._quote_decided: deque[str] = deque(maxlen=200)
+        # 最近被撤回的消息（消息 id 和 serverId 都记），回复它的话就不再发
+        self._recalled: deque[str] = deque(maxlen=500)
         self.calls = CallBridge(self.client, cfg) if cfg.get("call_enable") else None
         self._call_task: asyncio.Task | None = None
 
@@ -262,6 +266,10 @@ class WeChatAgentAdapter(Platform):
 
     # ------------------------------------------------------------ inbound
     async def handle_event(self, event: dict) -> AstrBotMessage | None:
+        if event.get("kind") == "message.recalled":
+            data = event.get("data") or {}
+            self._recalled.extend(str(k) for k in (data.get("messageId"), data.get("serverId")) if k)
+            return None
         if event.get("kind") != "message.committed":
             return None
         data = event.get("data") or {}
@@ -296,6 +304,9 @@ class WeChatAgentAdapter(Platform):
             return False
         return time.time() - ts > self.max_age
 
+    def is_recalled(self, *ids: str | None) -> bool:
+        return any(i and str(i) in self._recalled for i in ids)
+
     def _note(self, thread_id: str, message_id: str, from_self: bool) -> None:
         self._thread_log.setdefault(thread_id, deque(maxlen=40)).append((message_id, from_self, time.monotonic()))
 
@@ -311,16 +322,15 @@ class WeChatAgentAdapter(Platform):
         return random.random() < quote_probability(text_length, prev_self, prev_seconds, distance)
 
     async def convert_message(self, msg: dict) -> AstrBotMessage | None:
-        if msg.get("direction") != "incoming":
+        if msg.get("direction") != "incoming" or msg.get("recall"):
             return None
         mtype = msg.get("type")
         if mtype not in SUPPORTED_TYPES:
             return None
         app_type = msg.get("appMessageType")
-        if mtype == 49 and app_type not in (57, 1, None):
-            # 仅处理引用回复(57)和文字类应用消息；上传提示(74)等忽略
-            if app_type != 57:
-                return None
+        link = msg.get("link") or {}
+        if mtype == 49 and app_type not in APP_TEXT_TYPES and not link.get("url"):
+            return None  # 上传提示(74)等忽略
         thread_id = str(msg.get("threadId") or "")
         sender_id = str(msg.get("senderId") or "")
         if not thread_id or not sender_id:
@@ -357,7 +367,7 @@ class WeChatAgentAdapter(Platform):
 
         quote = msg.get("quote")
         if quote:
-            qtext = quote.get("embeddedText") or ""
+            qtext = quote.get("embeddedText") or _link_text(quote.get("embeddedLink"))
             qsender = self.own_id if quote.get("direction") == "outgoing" else str(quote.get("senderId") or "")
             qchain: list[BaseMessageComponent] = [Plain(qtext)] if qtext else []
             if quote.get("type") == 3 and quote.get("embeddedImage"):
@@ -378,6 +388,10 @@ class WeChatAgentAdapter(Platform):
 
         if mtype == 1 or (mtype == 49):
             text = body.strip()
+            if link.get("url"):
+                text = _link_text(link)
+            elif app_type == 19 and text:
+                text = f"[聊天记录]\n{text}"  # 守护进程已把合并转发整理成「谁：说了什么」
             if text:
                 chain.append(Plain(text))
         elif mtype in (3, 47):
@@ -570,6 +584,9 @@ class WeChatAgentAdapter(Platform):
                 buf.append(comp.text)
                 continue
             await flush()
+            if isinstance(comp, Record):
+                await self._send_voice_parts(thread_id, comp)
+                continue
             await self._paced(lambda: self._send_component(thread_id, comp))
         await flush()
 
@@ -608,17 +625,6 @@ class WeChatAgentAdapter(Platform):
             src = await self.client.upload(data, name, ctype)
             job = await self.client.send_media(thread_id, "image", src["id"])
             await self._finish_job(job, "image")
-        elif isinstance(comp, Record):
-            path = await comp.convert_to_file_path()
-            # TTS 流式 wav 的头部长度是占位值（会被读成几万秒），守护进程转语音会 500；先用 ffmpeg 重写成规整 wav
-            path = await to_wav(path) or path
-            raw = Path(path).read_bytes()
-            dur = await audio_duration_ms(path)
-            name = os.path.basename(path)
-            ctype = _audio_ctype(name)
-            src = await self.client.upload(raw, name, ctype)
-            job = await self.client.send_media(thread_id, "voice", src["id"], duration_ms=dur)
-            await self._finish_job(job, "voice", timeout=300)
         elif isinstance(comp, Video):
             path = await comp.convert_to_file_path()
             src = await self.client.upload(Path(path).read_bytes(), os.path.basename(path), "video/mp4")
@@ -631,6 +637,34 @@ class WeChatAgentAdapter(Platform):
             await self._finish_job(job, "file", timeout=600)
         else:
             logger.debug(f"[wechat_agent] 忽略不支持的消息段 {type(comp).__name__}")
+
+    async def _send_voice_parts(self, thread_id: str, comp: Record) -> None:
+        """语音：超过 VOICE_MAX_SECONDS 按换气停顿切成几条，每条单独走发送节流。"""
+        path = await comp.convert_to_file_path()
+        # TTS 流式 wav 的头部长度是占位值（会被读成几万秒），守护进程转语音会 500；先用 ffmpeg 重写成规整 wav
+        path = await to_wav(path) or path
+        dur = await audio_duration_ms(path)
+        too_long = bool(dur and dur > VOICE_MAX_SECONDS * 1000)
+        parts = await split_voice(path, dur) if too_long else []
+        if too_long:
+            logger.info(f"[wechat_agent] 语音 {dur / 1000:.0f}s 超长，切成 {len(parts) or 1} 段")
+        try:
+            for p in parts or [path]:
+                await self._paced(lambda p=p: self._send_voice(thread_id, p))
+        finally:
+            for p in parts:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    async def _send_voice(self, thread_id: str, path: str) -> None:
+        raw = Path(path).read_bytes()
+        dur = await audio_duration_ms(path)
+        name = os.path.basename(path)
+        src = await self.client.upload(raw, name, _audio_ctype(name))
+        job = await self.client.send_media(thread_id, "voice", src["id"], duration_ms=dur)
+        await self._finish_job(job, "voice", timeout=300)
 
     async def _finish_job(self, job: dict, kind: str, timeout: float = 65.0) -> None:
         job = await self.client.wait_job(job, timeout)
@@ -683,6 +717,15 @@ def make_typo(text: str) -> tuple[str, str | None]:
     i, c = random.choice(cands)
     typo = random.choice(_HOMOPHONES[c])
     return text[:i] + typo + text[i + 1:], (c if random.random() < 0.5 else None)
+
+
+def _link_text(link: dict | None) -> str:
+    """分享卡片（文章/视频/音乐/视频号）转文字；网址单独一行，解析插件能认出来。"""
+    if not link:
+        return ""
+    head = " ".join(x for x in (link.get("title"), f"（{link['sourceName']}）" if link.get("sourceName") else "") if x)
+    lines = [f"[分享] {head}".rstrip(), link.get("description") or "", link.get("url") or ""]
+    return "\n".join(x for x in lines if x)
 
 
 def _flatten(comps):

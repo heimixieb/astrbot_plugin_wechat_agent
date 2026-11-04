@@ -34,7 +34,7 @@ class FakeDaemon:
         self.port = 0
 
     def app(self):
-        app = web.Application(middlewares=[self.auth])
+        app = web.Application(middlewares=[self.auth], client_max_size=64 * 1024 * 1024)
         r = app.router
         r.add_get("/v1/accounts", self.accounts)
         r.add_get(f"/v1/accounts/{ACC}", self.account)
