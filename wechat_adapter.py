@@ -46,14 +46,17 @@ from astrbot.core.platform.platform import PlatformStatus
 from .wechat_call import CallBridge
 from .wechat_client import SUCCESS_JOB_STATES, WeChatApiError, WeChatClient
 from .wechat_event import WeChatAgentMessageEvent
-from .wechat_media import VOICE_MAX_SECONDS, audio_duration_ms, prepare_image_bytes, split_voice, to_wav
+from .wechat_media import VOICE_MAX_SECONDS, audio_duration_ms, prepare_image_bytes, qr_modules, qr_text, split_voice, to_wav
 
 ADAPTER_NAME = "wechat_agent"
 SUPPORTED_TYPES = {1, 3, 34, 47, 49}
 # 49 类应用消息里按文字处理的：分享文字(1)、聊天记录合并转发(19)、引用回复(57)、群公告(87)；带 link 的卡片另算
 APP_TEXT_TYPES = {1, 19, 57, 87, None}
-RECENT_IMAGE_SECONDS = 180  # 发图后多久内 @ 机器人算「说的是这张图」
 _MENTION_PREFIX = re.compile(r"^(?:@[^\s\u2005\u00a0]+[\u2005\u00a0 ]+)+")
+LOGIN_QR_FILE = "login_qr.png"
+# 登录操作的结束状态（和 wx auth login 一致）
+LOGIN_GRACE_SECONDS = 45  # 发现没登录后先等这么久，让守护进程自己重连
+LOGIN_DONE = {"succeeded", "failed", "cancelled", "expired", "rejected", "needs_login", "approval_required", "challenge_required"}
 
 DEFAULT_CONFIG = {
     "id": "wechat",
@@ -64,16 +67,72 @@ DEFAULT_CONFIG = {
     "token": "",
     "account": "",  # 守护进程里的账号 id 或别名；留空 = 用第一个账号
     "consumer": "astrbot",
+    "auto_login": True,  # 没登录时在 AstrBot 日志里打出登录二维码
     "download_media": True,
     "media_wait_seconds": 20,
     "max_media_mb": 32,
+    "send_min_interval": 2.0,
+    "send_max_interval": 4.0,
+    "send_max_per_minute": 12,
+    "max_message_age_seconds": 300,  # 停机恢复后补到的旧消息超过这个秒数就不处理（0 = 不限）
+    "quote_reply": True,  # 群聊偶尔引用对方（麦麦式概率）
+    "skip_recalled": True,  # 对方撤回了就不回
+    "attach_recent_image": True,  # 先发图再 @ 机器人时把图带上
+    "recent_image_seconds": 180,
+    "parse_share_card": True,  # 分享卡片 / 聊天记录转文字
+    "split_long_voice": True,  # 超过 55 秒的语音切成几条
     "call_enable": False,  # 微信语音来电 → 豆包实时语音（需守护进程 ≥1.4.0、环境变量 DOUBAO_REALTIME_API_KEY）
     "call_allow": [],  # 允许接听的来电 wxid
     "call_voice": "zh_female_xiaohe_jupiter_bigtts",
     "call_speech_rate": 0,  # 电话语速 -50~100，0 正常，100 = 2 倍速
     "call_greeting": "喂？你好呀～",
     "call_prompt_file": "",  # 电话里用的人设文件；留空 = 插件自带的 call_prompt.md
-    "max_message_age_seconds": 300,  # 停机恢复后补到的旧消息超过这个秒数就不处理（0 = 不限）
+    "call_max_minutes": 10,
+    "call_api_key_env": "DOUBAO_REALTIME_API_KEY",
+}
+
+# WebUI「机器人」页的表单说明（不写的话只显示原始键名）
+CONFIG_METADATA = {
+    "base_url": {"description": "守护进程地址", "type": "string",
+                 "hint": "agent-wechat 守护进程的地址，默认 http://127.0.0.1:6174。守护进程只听本机，AstrBot 在 Docker 里时要用 host 网络。"},
+    "token_file": {"description": "Token 文件路径", "type": "string",
+                   "hint": "守护进程 tokenFile 指向的那个文件。Docker 里要把它只读挂进容器，比如挂到 /run/secrets/wechat-api-token。"},
+    "token": {"description": "Token（直接填）", "type": "string", "secret": True,
+              "hint": "不想挂文件就直接填 token。填了 token_file 时优先读文件。"},
+    "account": {"description": "账号", "type": "string",
+                "hint": "守护进程里的账号 id 或别名。留空用第一个；守护进程里一个账号都没有时，开着「自动扫码登录」会自动建一个。"},
+    "consumer": {"description": "事件消费者名", "type": "string", "hint": "一般不用改。"},
+    "auto_login": {"description": "自动扫码登录", "type": "bool",
+                   "hint": "微信没登录时自动发起登录：能免扫码就免扫码，不行就把二维码打在 AstrBot 日志里（同时存成图片），用手机微信扫码并在手机上点确认。"},
+    "download_media": {"description": "下载收到的图片和语音", "type": "bool", "hint": "关掉后机器人看不到图、听不到语音。"},
+    "media_wait_seconds": {"description": "媒体下载等待秒数", "type": "float"},
+    "max_media_mb": {"description": "媒体大小上限（MB）", "type": "float"},
+    "send_min_interval": {"description": "发送间隔下限（秒）", "type": "float",
+                          "hint": "防风控：每条消息之间随机等 下限~上限 秒。设 0 不等。"},
+    "send_max_interval": {"description": "发送间隔上限（秒）", "type": "float"},
+    "send_max_per_minute": {"description": "每分钟最多发几条", "type": "int", "hint": "防风控，0 = 不限。"},
+    "max_message_age_seconds": {"description": "旧消息不回（秒）", "type": "int",
+                                "hint": "机器人停了很久再恢复时，超过这么多秒的旧消息不回复。0 = 不限。"},
+    "quote_reply": {"description": "群聊偶尔引用对方", "type": "bool",
+                    "hint": "照搬 MaiBot 的概率：她回的那条后面插进来的消息越多，越倾向引用原消息（约 10%~31%）；私聊从不引用。"},
+    "skip_recalled": {"description": "撤回了就不回", "type": "bool", "hint": "对方撤回了消息、机器人还没回的话，这条回复就不发了。"},
+    "attach_recent_image": {"description": "先发图再 @ 时带上图", "type": "bool",
+                            "hint": "微信图文不能同条发。群里有人发图后不久又 @ 机器人，把他刚发的图带进这条，看图、改图插件都能拿到。"},
+    "recent_image_seconds": {"description": "带图时限（秒）", "type": "int", "hint": "发图后多少秒内 @ 才算在说这张图。"},
+    "parse_share_card": {"description": "分享卡片转文字", "type": "bool",
+                         "hint": "文章/视频/音乐/视频号分享转成「标题 + 简介 + 网址」，聊天记录合并转发转成「谁：说了什么」。关掉就忽略这类消息。"},
+    "split_long_voice": {"description": "长语音自动切段", "type": "bool",
+                         "hint": "微信语音最长 60 秒，超过 55 秒的按换气停顿切成几条发。关掉后超长语音会发送失败。"},
+    "call_enable": {"description": "接听语音电话", "type": "bool",
+                    "hint": "白名单里的人打来微信语音，自动接到豆包端到端实时语音。需要守护进程 ≥1.4.0 和豆包 API Key（见下面的环境变量名）。"},
+    "call_allow": {"description": "允许来电的 wxid", "type": "list", "hint": "其他人打来自动拒接。"},
+    "call_voice": {"description": "电话音色", "type": "string", "hint": "豆包音色 id，也可以填自己复刻的 S_ 开头音色。"},
+    "call_speech_rate": {"description": "电话语速", "type": "int", "hint": "-50~100，0 正常，100 = 2 倍速。"},
+    "call_greeting": {"description": "接通第一句", "type": "string"},
+    "call_prompt_file": {"description": "电话人设文件", "type": "string", "hint": "留空用插件自带的 call_prompt.md。"},
+    "call_max_minutes": {"description": "单次通话最长（分钟）", "type": "int"},
+    "call_api_key_env": {"description": "豆包 API Key 环境变量名", "type": "string",
+                         "hint": "AstrBot 进程里放 Key 的环境变量名，默认 DOUBAO_REALTIME_API_KEY。"},
 }
 
 
@@ -82,7 +141,9 @@ DEFAULT_CONFIG = {
     "个人微信（agent-wechat 守护进程）",
     default_config_tmpl=DEFAULT_CONFIG,
     adapter_display_name="微信 (agent-wechat)",
+    logo_path="logo.png",
     support_streaming_message=False,
+    config_metadata=CONFIG_METADATA,
 )
 class WeChatAgentAdapter(Platform):
     def __init__(self, platform_config: dict, platform_settings: dict, event_queue: asyncio.Queue) -> None:
@@ -103,6 +164,14 @@ class WeChatAgentAdapter(Platform):
         # 风控：本账号所有发送串行，条间隔随机 send_min~max_interval 秒，每分钟最多 send_max_per_minute 条
         self.send_gap = (float(cfg.get("send_min_interval", 2.0)), float(cfg.get("send_max_interval", 4.0)))
         self.send_per_min = int(cfg.get("send_max_per_minute", 12))
+        # 可选功能（默认全开，WebUI 里可单独关）
+        self.auto_login = bool(cfg.get("auto_login", True))
+        self.quote_reply = bool(cfg.get("quote_reply", True))
+        self.skip_recalled = bool(cfg.get("skip_recalled", True))
+        self.attach_recent_image = bool(cfg.get("attach_recent_image", True))
+        self.recent_image_seconds = float(cfg.get("recent_image_seconds", 180))
+        self.parse_share_card = bool(cfg.get("parse_share_card", True))
+        self.split_long_voice = bool(cfg.get("split_long_voice", True))
         self._send_lock = asyncio.Lock()
         self._last_send = 0.0
         self._sent_times: deque[float] = deque()
@@ -122,7 +191,8 @@ class WeChatAgentAdapter(Platform):
         self._group_names: dict[str, tuple[str, float]] = {}
         self._member_names: dict[str, tuple[dict[str, str], float]] = {}
         self._last_state_log = ""
-        self.stats = {"received": 0, "ignored": 0, "sent": 0, "errors": 0}
+        self._unauth_since = 0.0
+        self.stats ={"received": 0, "ignored": 0, "sent": 0, "errors": 0}
         # 群聊引用概率用：每个群最近的发言 (消息id, 是否自己, 时间)，以及已决定过是否引用的目标消息
         self._thread_log: dict[str, deque[tuple[str, bool, float]]] = {}
         self._quote_decided: deque[str] = deque(maxlen=200)
@@ -179,11 +249,29 @@ class WeChatAgentAdapter(Platform):
             self._call_task = asyncio.create_task(self.calls.run())  # 等账号解析好后自己连通话控制通道
         while not self._stop.is_set():
             try:
-                acc = await self.client.resolve_account()
+                try:
+                    acc = await self.client.resolve_account()
+                except WeChatApiError as e:
+                    if e.code != "no_account" or not self.auto_login:
+                        raise
+                    new_id = self.client.account_hint or "astrbot"
+                    await self.client.create_account(new_id)
+                    logger.info(f"[wechat_agent] 守护进程里还没有账号，已自动创建账号「{new_id}」")
+                    acc = await self.client.resolve_account()
                 if not acc.get("authenticated"):
-                    self._log_state("unauth", "微信账号尚未登录（需扫码），30 秒后重试；请在守护进程那边运行 wx auth login 扫码登录")
+                    # 守护进程刚重启时会自己用保存的登录态重连，先等一会儿，别抢着发起登录
+                    self._unauth_since = self._unauth_since or time.monotonic()
+                    if self.auto_login and time.monotonic() - self._unauth_since >= LOGIN_GRACE_SECONDS:
+                        await self._login()
+                        continue
+                    if self.auto_login:
+                        self._log_state("unauth_wait", "微信还没登录，先等守护进程自己重连；连不上会自动发起扫码登录")
+                        await self._sleep(10)
+                        continue
+                    self._log_state("unauth", "微信账号尚未登录，30 秒后重试；请在守护进程那边运行 wx auth login 扫码，或在适配器配置里打开「自动扫码登录」")
                     await self._sleep(30)
                     continue
+                self._unauth_since = 0.0
                 self.own_id = str(acc.get("ownUsername") or "")
                 if not self.own_id:
                     acc = await self.client.account()
@@ -203,15 +291,17 @@ class WeChatAgentAdapter(Platform):
                 raise
             except WeChatApiError as e:
                 self.stats["errors"] += 1
-                if e.status == 401 or e.status == 403:
-                    self._log_state("auth", f"守护进程拒绝 token ({e.status})，检查 token_file")
-                else:
-                    self._log_state(f"api{e.status}{e.code}", f"守护进程返回错误: {e}")
+                self._log_state(f"api{e.status}{e.code}", self._explain(e))
                 await self._sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                 self.stats["errors"] += 1
-                self._log_state("conn", f"连接守护进程失败/中断: {type(e).__name__}，{backoff:.0f}s 后重连")
+                self._log_state(
+                    "conn",
+                    f"连不上守护进程 {self.client.base_url}（{type(e).__name__}），{backoff:.0f}s 后重连。"
+                    "请确认守护进程在运行（wx daemon status 或 systemctl status）；"
+                    "守护进程只听本机 127.0.0.1，AstrBot 在 Docker 里时要给容器开 host 网络（network_mode: host）",
+                )
                 await self._sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
             except Exception as e:  # noqa: BLE001
@@ -219,6 +309,59 @@ class WeChatAgentAdapter(Platform):
                 logger.exception(f"[wechat_agent] 未预期错误: {e}")
                 await self._sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+    def _explain(self, e: WeChatApiError) -> str:
+        """守护进程报错 → 带解决办法的中文提示。"""
+        if e.status in (401, 403):
+            tf = self.client.token_file
+            if tf and not os.path.isfile(tf) and not self.client._token:
+                return f"找不到 token 文件 {tf}：AstrBot 在 Docker 里时要把守护进程的 token 文件挂进容器，或者在配置里直接填 token"
+            return f"守护进程拒绝了 token（{e.status}）：token_file / token 要和守护进程配置里 tokenFile 的内容一致"
+        if e.code == "no_account":
+            return "守护进程里还没有微信账号：运行 wx accounts create <名字> 再 wx auth login，或打开「自动扫码登录」让插件自动建"
+        if e.code == "account_not_found":
+            return f"守护进程里没有叫「{self.client.account_hint}」的账号：用 wx accounts list 查一下，或把 account 留空用第一个"
+        return f"守护进程返回错误: {e}"
+
+    async def _login(self) -> None:
+        """没登录：先试免扫码，不行把二维码打进日志、存成图片；结束后回主循环重新检查登录状态。"""
+        op = await self.client.start_login()
+        op_id = str(op.get("id") or "")
+        qr_path = self._data_dir / LOGIN_QR_FILE
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        shown, approval, lan = 0, False, False
+        deadline = time.monotonic() + 340
+        while op_id and not self._stop.is_set() and time.monotonic() < deadline:
+            state = str(op.get("state") or "")
+            result = op.get("result") or {}
+            if state in LOGIN_DONE:
+                break
+            gen = int(result.get("qrGeneration") or 0)
+            if result.get("qrAvailable") and gen > shown:
+                shown = gen
+                png = await self.client.login_qr(op_id, gen)
+                qr_path.write_bytes(png)
+                mods = qr_modules(png)
+                art = "\n" + qr_text(mods) if mods else ""
+                logger.warning(f"[wechat_agent] 微信未登录，请用手机微信扫下面的二维码（约 2 分钟换一张），图片也存在 {qr_path}{art}")
+            if state == "awaiting_approval" and not approval:
+                logger.warning("[wechat_agent] 已扫码，请在手机微信上点「登录」确认")
+            approval = state == "awaiting_approval"
+            if result.get("lanChallenge") == "waiting_for_phone" and not lan:
+                lan = True
+                logger.warning("[wechat_agent] 微信要求本地网络验证：让手机连到能访问这台机器的网络")
+            await self._sleep(2)
+            op = await self.client.operation(op_id)
+        state = str(op.get("state") or "")
+        try:
+            qr_path.unlink()
+        except OSError:
+            pass
+        if state == "succeeded":
+            logger.info("[wechat_agent] 微信登录成功")
+        else:
+            logger.warning(f"[wechat_agent] 这次登录没成功（{state or '超时'}），30 秒后重新发起")
+            await self._sleep(30)
 
     def _load_cursor(self) -> str:
         try:
@@ -309,7 +452,7 @@ class WeChatAgentAdapter(Platform):
         return time.time() - ts > self.max_age
 
     def is_recalled(self, *ids: str | None) -> bool:
-        return any(i and str(i) in self._recalled for i in ids)
+        return self.skip_recalled and any(i and str(i) in self._recalled for i in ids)
 
     def _note(self, thread_id: str, message_id: str, from_self: bool) -> None:
         self._thread_log.setdefault(thread_id, deque(maxlen=40)).append((message_id, from_self, time.monotonic()))
@@ -335,6 +478,8 @@ class WeChatAgentAdapter(Platform):
         link = msg.get("link") or {}
         if mtype == 49 and app_type not in APP_TEXT_TYPES and not link.get("url"):
             return None  # 上传提示(74)等忽略
+        if mtype == 49 and not self.parse_share_card and (link.get("url") or app_type == 19):
+            return None  # 关了「分享卡片转文字」：分享卡片和聊天记录都不处理
         thread_id = str(msg.get("threadId") or "")
         sender_id = str(msg.get("senderId") or "")
         if not thread_id or not sender_id:
@@ -402,7 +547,7 @@ class WeChatAgentAdapter(Platform):
             path = await self._fetch_media(msg, kind="image")
             if path:
                 chain.append(Image.fromFileSystem(path))
-                if is_group:
+                if is_group and self.attach_recent_image:
                     self._recent_image[(thread_id, sender_id)] = (path, abm.timestamp)
             else:
                 text = "[图片(下载失败)]"
@@ -421,10 +566,10 @@ class WeChatAgentAdapter(Platform):
                     chain.append(At(qq=str(uid), name=await self._nickname(thread_id, str(uid), True)))
 
         # 先发图再 @ 她说「把这张扩一下」：把这人刚发的图带上，看图和画图插件都能拿到
-        if is_group and at_self and mtype not in (3, 47):
+        if self.attach_recent_image and is_group and at_self and mtype not in (3, 47):
             recent = self._recent_image.pop((thread_id, sender_id), None)
             quoted_img = any(isinstance(c, Reply) and any(isinstance(x, Image) for x in c.chain) for c in chain)
-            if recent and not quoted_img and abm.timestamp - recent[1] <= RECENT_IMAGE_SECONDS and os.path.exists(recent[0]):
+            if recent and not quoted_img and abm.timestamp - recent[1] <= self.recent_image_seconds and os.path.exists(recent[0]):
                 chain.append(Image.fromFileSystem(recent[0]))
 
         abm.message = chain
@@ -566,7 +711,7 @@ class WeChatAgentAdapter(Platform):
                 if is_group and str(comp.qq) not in mention_ids:
                     mention_ids.append(str(comp.qq))
         text_length = sum(len(c.text) for c in comps if isinstance(c, Plain))
-        if is_group and reply_message_id and quote_comp is None and text_length:
+        if self.quote_reply and is_group and reply_message_id and quote_comp is None and text_length:
             if self._want_quote(thread_id, reply_message_id, text_length):
                 quote_comp = Reply(id=reply_message_id)
 
@@ -652,7 +797,7 @@ class WeChatAgentAdapter(Platform):
         # TTS 流式 wav 的头部长度是占位值（会被读成几万秒），守护进程转语音会 500；先用 ffmpeg 重写成规整 wav
         path = await to_wav(path) or path
         dur = await audio_duration_ms(path)
-        too_long = bool(dur and dur > VOICE_MAX_SECONDS * 1000)
+        too_long = self.split_long_voice and bool(dur and dur > VOICE_MAX_SECONDS * 1000)
         parts = await split_voice(path, dur) if too_long else []
         if too_long:
             logger.info(f"[wechat_agent] 语音 {dur / 1000:.0f}s 超长，切成 {len(parts) or 1} 段")

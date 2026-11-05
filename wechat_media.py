@@ -38,6 +38,40 @@ def prepare_image_bytes(data: bytes, name: str = "image") -> tuple[bytes, str, s
         return data, os.path.basename(name) or "image", ctype
 
 
+def qr_modules(png: bytes) -> list[list[bool]] | None:
+    """守护进程给的登录二维码 PNG → 模块矩阵（True=黑）。按左上角定位块（7 个模块宽）量出模块大小再逐格取样。"""
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(png)).convert("L")
+    except Exception:
+        return None
+    dark = im.point(lambda p: 255 if p < 128 else 0)
+    bbox = dark.getbbox()
+    if not bbox:
+        return None
+    im = im.crop(bbox)
+    w, h = im.size
+    px = im.load()
+    run = 0
+    while run < w and px[run, 0] < 128:
+        run += 1
+    m = run / 7
+    n = round(w / m) if m else 0
+    if m < 1 or not 21 <= n <= 177 or abs(round(h / m) - n) > 1:
+        return None
+    return [[px[min(w - 1, int((x + 0.5) * m)), min(h - 1, int((y + 0.5) * m))] < 128 for x in range(n)] for y in range(n)]
+
+
+def qr_text(modules: list[list[bool]], quiet: int = 2) -> str:
+    """模块矩阵 → 终端/日志里能扫的字符画：亮的模块画成方块（适合深色背景的日志窗口），两行合成一个字符。"""
+    n = len(modules) + 2 * quiet
+    light = [[not (quiet <= y < n - quiet and quiet <= x < n - quiet and modules[y - quiet][x - quiet]) for x in range(n)] for y in range(n)]
+    light.append([False] * n)
+    chars = {(True, True): "█", (True, False): "▀", (False, True): "▄", (False, False): " "}
+    return "\n".join("".join(chars[(light[y][x], light[y + 1][x])] for x in range(n)) for y in range(0, n, 2))
+
+
 async def audio_duration_ms(path: str) -> int | None:
     try:
         proc = await asyncio.create_subprocess_exec(

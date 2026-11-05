@@ -30,6 +30,12 @@ class FakeDaemon:
         self.avatars: dict[str, bytes] = {}  # 已缓存的头像
         self.avatar_remote: dict[str, bytes] = {}  # 刷新后才会出现的头像
         self.avatar_refreshes: list[str] = []
+        self.no_account = False  # True = 守护进程里一个账号都没有
+        self.created: list[dict] = []
+        self.login_bodies: list[dict] = []
+        self.login_states = ["succeeded"]  # 每次查登录进度依次返回的状态
+        self.qr_png = b""
+        self.qr_fetches: list[str] = []
         self.runner = None
         self.port = 0
 
@@ -37,6 +43,10 @@ class FakeDaemon:
         app = web.Application(middlewares=[self.auth], client_max_size=64 * 1024 * 1024)
         r = app.router
         r.add_get("/v1/accounts", self.accounts)
+        r.add_post("/v1/accounts", self.create_account)
+        r.add_post(f"/v1/accounts/{ACC}/auth/login", self.login)
+        r.add_get(f"/v1/accounts/{ACC}/operations/{{oid}}", self.operation)
+        r.add_get(f"/v1/accounts/{ACC}/operations/{{oid}}/qr", self.qr)
         r.add_get(f"/v1/accounts/{ACC}", self.account)
         r.add_get(f"/v1/accounts/{ACC}/capabilities", self.caps)
         r.add_get(f"/v1/accounts/{ACC}/events", self.events_page)
@@ -76,7 +86,30 @@ class FakeDaemon:
         await self.runner.cleanup()
 
     # handlers
+    async def create_account(self, req):
+        self.created.append(await req.json())
+        self.no_account = False
+        return web.json_response({"id": ACC}, status=201)
+
+    async def login(self, req):
+        self.login_bodies.append(await req.json())
+        return web.json_response({"id": "op1", "kind": "login", "state": "running",
+                                  "result": {"qrAvailable": True, "qrGeneration": 1}}, status=202)
+
+    async def operation(self, req):
+        state = self.login_states.pop(0) if self.login_states else "succeeded"
+        if state == "succeeded":
+            self.authenticated = True
+        return web.json_response({"id": req.match_info["oid"], "kind": "login", "state": state,
+                                  "result": {"qrAvailable": True, "qrGeneration": 1}})
+
+    async def qr(self, req):
+        self.qr_fetches.append(req.query.get("generation", ""))
+        return web.Response(body=self.qr_png, content_type="image/png")
+
     async def accounts(self, req):
+        if self.no_account:
+            return web.json_response({"items": []})
         return web.json_response({"items": [{
             "id": ACC, "alias": "dafeiyu", "authenticated": self.authenticated,
             "ownUsername": "wxid_bot" if self.authenticated else None}]})

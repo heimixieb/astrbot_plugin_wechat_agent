@@ -1,0 +1,15 @@
+# AstrBot 跑在 Docker 里、守护进程用 install_daemon.sh 装在宿主机上时的示例。
+# 关键只有两处：host 网络（守护进程只听宿主机 127.0.0.1）+ 把 token 文件只读挂进容器。
+services:
+  astrbot:
+    image: soulter/astrbot:latest
+    container_name: astrbot
+    restart: unless-stopped
+    network_mode: host          # 容器里的 127.0.0.1:6174 就是宿主机的守护进程；面板仍是 http://<服务器IP>:6185
+    environment:
+      - TZ=Asia/Shanghai
+      # 用语音电话时再加：- DOUBAO_REALTIME_API_KEY=你的火山引擎 API Key
+    volumes:
+      - ./data:/AstrBot/data
+      # 左边改成 install_daemon.sh 最后打印的 token 路径
+      - ~/agent-wechat/secrets/api-token:/run/secrets/wechat-api-token:ro

@@ -1,4 +1,10 @@
 {
+    "summary_enable": {
+        "description": "开启「总结群聊」指令",
+        "type": "bool",
+        "hint": "群里发 /总结群聊（或 群聊总结、群聊摘要）让机器人总结最近的聊天。关掉后这几个指令不响应。",
+        "default": true
+    },
     "bot_name": {
         "description": "机器人名字（群聊总结里怎么称呼它自己）",
         "type": "string",

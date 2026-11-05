@@ -11,6 +11,7 @@ from .wechat_adapter import WeChatAgentAdapter  # noqa: F401
 CST = timezone(timedelta(hours=8))
 MEDIA_TEXT = {3: "[图片]", 47: "[表情]", 34: "[语音]", 43: "[视频]", 48: "[位置]", 42: "[名片]"}
 DEFAULTS = {
+    "summary_enable": True,
     "bot_name": "机器人",
     "summary_prompt": (
         "你是群里的「{bot_name}」。下面是群聊记录（时间 昵称: 内容）。"
@@ -60,7 +61,7 @@ class WeChatAgentPlugin(Star):
         """总结本群最近的聊天（默认 24 小时内、最多 200 条）。"""
         adapter = getattr(event, "platform", None)
         group_id = event.get_group_id()
-        if event.get_platform_name() != "wechat_agent" or not group_id or adapter is None:
+        if not self.cfg["summary_enable"] or event.get_platform_name() != "wechat_agent" or not group_id or adapter is None:
             return
         cooldown = int(self.cfg["summary_cooldown"])
         wait = cooldown - (time.monotonic() - self._last_summary.get(group_id, -cooldown))

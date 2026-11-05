@@ -154,6 +154,24 @@ class WeChatClient:
     async def account(self) -> dict:
         return await self.request("GET", f"v1/accounts/{self.account_id}")
 
+    async def create_account(self, account_id: str) -> dict:
+        return await self.request("POST", "v1/accounts", json_body={"id": account_id})
+
+    # ---------- login ----------
+    async def start_login(self, timeout_seconds: int = 300, key: str | None = None) -> dict:
+        """先试已保存的设备免扫码登录，不行再出二维码（守护进程每 ~2 分钟自动换一张，最多换 3 次）。"""
+        body = {"strategy": "auto", "allowQr": True, "timeoutSeconds": timeout_seconds,
+                "qrRefresh": {"mode": "auto", "maxRefreshes": 3}}
+        return await self.request("POST", self._acc("auth/login"), json_body=body,
+                                  headers={"Idempotency-Key": key or uuid.uuid4().hex})
+
+    async def operation(self, operation_id: str) -> dict:
+        return await self.request("GET", self._acc(f"operations/{operation_id}"))
+
+    async def login_qr(self, operation_id: str, generation: int) -> bytes:
+        data, _ = await self._get_bytes(self._acc(f"operations/{operation_id}/qr?generation={generation}"), 2 * 1024 * 1024)
+        return data
+
     async def capabilities(self) -> dict:
         return await self.request("GET", self._acc("capabilities"))
 

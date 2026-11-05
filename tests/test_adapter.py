@@ -508,3 +508,111 @@ class RecallTest(Base):
                                    "data": {"threadId": OWNER, "messageId": "other", "serverId": "1"}})
         await ev.send(MessageChain([Plain("在")]))
         self.assertEqual(self.d.sends[0]["text"], "在")
+
+
+def qr_png(modules, m=6, border=24):
+    n = len(modules)
+    im = PILImage.new("L", (n * m + 2 * border, n * m + 2 * border), 255)
+    for y, row in enumerate(modules):
+        for x, dark in enumerate(row):
+            if dark:
+                im.paste(0, (border + x * m, border + y * m, border + (x + 1) * m, border + (y + 1) * m))
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+def fake_modules(n=25):
+    import random as r
+    rnd = r.Random(7)
+    g = [[rnd.random() < 0.5 for _ in range(n)] for _ in range(n)]
+    for y in range(7):  # 左上角定位块：外圈黑、内圈白、中心 3x3 黑
+        for x in range(8):
+            g[y][x] = x < 7 and (y in (0, 6) or x in (0, 6) or (2 <= x <= 4 and 2 <= y <= 4))
+    g[0][n - 1] = g[n - 1][0] = g[n - 1][n - 1] = True  # 真二维码另外两个角也有定位块，撑满边界
+    return g
+
+
+class LoginQrTest(Base):
+    def test_qr_png_roundtrip_and_text(self):
+        from astrbot_plugin_wechat_agent.wechat_media import qr_modules, qr_text
+        g = fake_modules()
+        self.assertEqual(qr_modules(qr_png(g)), g)
+        lines = qr_text(g).splitlines()
+        self.assertEqual(len(lines), (25 + 4 + 1) // 2)  # 两行一个字符，四周各留 2 格
+        self.assertTrue(all(len(line) == 29 for line in lines))
+        self.assertIsNone(qr_modules(b"not a png"))
+
+    async def test_login_fetches_qr_and_finishes(self):
+        async def no_sleep(_):
+            return None
+        self.a._sleep = no_sleep
+        self.d.authenticated = False
+        self.d.qr_png = qr_png(fake_modules())
+        self.d.login_states = ["awaiting_approval", "succeeded"]
+        await self.a._login()
+        self.assertEqual(self.d.login_bodies[0]["strategy"], "auto")
+        self.assertEqual(self.d.qr_fetches, ["1"])  # 同一张二维码只取一次
+        self.assertTrue(self.d.authenticated)
+        self.assertFalse((self.a._data_dir / "login_qr.png").exists())  # 登录完把图删掉
+
+    async def test_creates_account_when_daemon_has_none(self):
+        self.d.no_account = True
+        self.a.client.account_hint = ""
+        task = asyncio.create_task(self.a._run())
+        for _ in range(100):
+            if self.d.created and self.d.stream_calls:
+                break
+            await asyncio.sleep(0.05)
+        self.a._stop.set()
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(self.d.created, [{"id": "astrbot"}])
+        self.assertTrue(self.d.stream_calls)  # 建好账号就接着收消息了
+
+
+class ExplainTest(Base):
+    def test_missing_token_file_hint(self):
+        self.a.client.token_file = os.path.join(self.tmp, "nope")
+        self.a.client._token = ""
+        self.assertIn("找不到 token 文件", self.a._explain(WeChatApiError(401, "unauthorized")))
+
+    def test_wrong_token_and_account_hints(self):
+        self.assertIn("tokenFile", self.a._explain(WeChatApiError(401, "unauthorized")))
+        self.assertIn("wx accounts create", self.a._explain(WeChatApiError(404, "no_account")))
+        self.assertIn("wx accounts list", self.a._explain(WeChatApiError(404, "account_not_found")))
+
+
+class FeatureSwitchTest(Base):
+    async def test_quote_reply_off(self):
+        from unittest.mock import patch
+        self.a.quote_reply = False
+        g = "g1@chatroom"
+        await self.feed(msg("s1", g, "wxid_alice", 1, "今天去哪"))
+        with patch("astrbot_plugin_wechat_agent.wechat_adapter.random.random", return_value=0.0):
+            await self.a.send_chain(g, MessageChain([Plain("去公园")]), reply_message_id="s1")
+        self.assertNotIn("quote", self.d.sends[0])
+
+    async def test_skip_recalled_off(self):
+        self.a.skip_recalled = False
+        await self.feed(msg("s2", OWNER, OWNER, 1, "发错了", serverId="5151"))
+        ev = self.queue.get_nowait()
+        await self.a.handle_event({"cursor": "2", "kind": "message.recalled", "data": {"threadId": OWNER, "serverId": "5151"}})
+        await ev.send(MessageChain([Plain("收到")]))
+        self.assertEqual(self.d.sends[0]["text"], "收到")
+
+    async def test_attach_recent_image_off(self):
+        self.a.attach_recent_image = False
+        g = "g1@chatroom"
+        self.d.assets["s3"] = [{"id": "a8", "state": "available", "variant": "original", "actualVariant": "original", "contentType": "image/gif", "kind": "image"}]
+        self.d.content["a8"] = (gif_bytes(), "image/gif")
+        await self.feed(msg("s3", g, "wxid_bob", 3))
+        m = msg("s4", g, "wxid_bob", 1, "@大肥鱼\u2005扩一下")
+        m["mentions"].update(self=True, userIds=[BOT])
+        abm = await self.feed(m)
+        self.assertFalse(any(isinstance(c, Image) for c in abm.message))
+
+    async def test_parse_share_card_off(self):
+        self.a.parse_share_card = False
+        link = {"title": "猫猫视频", "url": "https://b23.tv/abc"}
+        self.assertIsNone(await self.feed(msg("s5", OWNER, OWNER, 49, "猫猫视频", appMessageType=5, link=link)))
+        self.assertIsNotNone(await self.feed(msg("s6", OWNER, OWNER, 1, "普通文字照常")))
