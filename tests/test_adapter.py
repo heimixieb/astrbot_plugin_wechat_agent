@@ -397,6 +397,24 @@ class QuotedImageTest(Base):
         reply = next(c for c in abm.message if isinstance(c, Reply))
         self.assertTrue(any(isinstance(c, Image) for c in reply.chain))
 
+    async def test_image_then_at_carries_image_once(self):
+        g = "g1@chatroom"
+        self.d.assets["p1"] = [{"id": "a7", "state": "available", "variant": "original", "actualVariant": "original", "contentType": "image/gif", "kind": "image"}]
+        self.d.content["a7"] = (gif_bytes(), "image/gif")
+        await self.feed(msg("p1", g, "wxid_bob", 3))
+        other = msg("t0", g, "wxid_alice", 1, "@大肥鱼 在吗")
+        other["mentions"].update(self=True, userIds=[BOT])
+        abm = await self.feed(other)  # 别人 @ 不带 bob 的图
+        self.assertFalse(any(isinstance(c, Image) for c in abm.message))
+        m = msg("t2", g, "wxid_bob", 1, "@大肥鱼 把这张扩一下")
+        m["mentions"].update(self=True, userIds=[BOT])
+        abm = await self.feed(m)
+        self.assertTrue(any(isinstance(c, Image) for c in abm.message))
+        m2 = msg("t3", g, "wxid_bob", 1, "@大肥鱼 好了吗")
+        m2["mentions"].update(self=True, userIds=[BOT])
+        abm = await self.feed(m2)  # 只带一次
+        self.assertFalse(any(isinstance(c, Image) for c in abm.message))
+
 
 class QuoteProbabilityTest(Base):
     def test_formula_matches_maibot(self):

@@ -52,6 +52,7 @@ ADAPTER_NAME = "wechat_agent"
 SUPPORTED_TYPES = {1, 3, 34, 47, 49}
 # 49 类应用消息里按文字处理的：分享文字(1)、聊天记录合并转发(19)、引用回复(57)、群公告(87)；带 link 的卡片另算
 APP_TEXT_TYPES = {1, 19, 57, 87, None}
+RECENT_IMAGE_SECONDS = 180  # 发图后多久内 @ 机器人算「说的是这张图」
 _MENTION_PREFIX = re.compile(r"^(?:@[^\s\u2005\u00a0]+[\u2005\u00a0 ]+)+")
 
 DEFAULT_CONFIG = {
@@ -127,6 +128,8 @@ class WeChatAgentAdapter(Platform):
         self._quote_decided: deque[str] = deque(maxlen=200)
         # 最近被撤回的消息（消息 id 和 serverId 都记），回复它的话就不再发
         self._recalled: deque[str] = deque(maxlen=500)
+        # 微信图文不能同条发：群里每人最近发的一张图 (路径, 时间)，紧接着 @ 机器人时带上
+        self._recent_image: dict[tuple[str, str], tuple[str, float]] = {}
         self.calls = CallBridge(self.client, cfg) if cfg.get("call_enable") else None
         self._call_task: asyncio.Task | None = None
 
@@ -399,6 +402,8 @@ class WeChatAgentAdapter(Platform):
             path = await self._fetch_media(msg, kind="image")
             if path:
                 chain.append(Image.fromFileSystem(path))
+                if is_group:
+                    self._recent_image[(thread_id, sender_id)] = (path, abm.timestamp)
             else:
                 text = "[图片(下载失败)]"
                 chain.append(Plain(text))
@@ -414,6 +419,13 @@ class WeChatAgentAdapter(Platform):
             for uid in mentions.get("userIds") or []:
                 if uid and uid != self.own_id:
                     chain.append(At(qq=str(uid), name=await self._nickname(thread_id, str(uid), True)))
+
+        # 先发图再 @ 她说「把这张扩一下」：把这人刚发的图带上，看图和画图插件都能拿到
+        if is_group and at_self and mtype not in (3, 47):
+            recent = self._recent_image.pop((thread_id, sender_id), None)
+            quoted_img = any(isinstance(c, Reply) and any(isinstance(x, Image) for x in c.chain) for c in chain)
+            if recent and not quoted_img and abm.timestamp - recent[1] <= RECENT_IMAGE_SECONDS and os.path.exists(recent[0]):
+                chain.append(Image.fromFileSystem(recent[0]))
 
         abm.message = chain
         abm.message_str = text

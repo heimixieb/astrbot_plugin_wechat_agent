@@ -5,7 +5,7 @@ desc: |
   通过 [agent-wechat](https://github.com/thisnick/agent-wechat) 守护进程（HTTP API + SSE）把个人微信接入 AstrBot。
   支持私聊/群聊、@ 与引用、图片/语音/视频/文件收发、群昵称与头像、防风控发送节流、微信语音通话（豆包端到端实时语音）、群聊总结。
 help: 先部署并登录 agent-wechat 守护进程（≥1.4.0），再在 WebUI「机器人 → 新增」里选 wechat_agent，填 base_url 和 token_file。详见 README。
-version: v1.1.1
+version: v1.1.2
 author: heimixieb
 repo: https://github.com/heimixieb/astrbot_plugin_wechat_agent
 astrbot_version: ">=4.29.0"
