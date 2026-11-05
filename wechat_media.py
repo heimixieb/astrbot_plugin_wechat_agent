@@ -142,7 +142,8 @@ async def split_voice(path: str, total_ms: int) -> list[str]:
 
 async def to_wav(path: str) -> str | None:
     """尝试把任意音频(含 silk 之外的格式)转成 wav，供 ASR 使用。失败返回 None。"""
-    out = tempfile.mktemp(suffix=".wav", dir=os.path.dirname(path))
+    fd, out = tempfile.mkstemp(suffix=".wav", dir=os.path.dirname(path))
+    os.close(fd)
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-loglevel", "error", "-i", path,
@@ -153,5 +154,9 @@ async def to_wav(path: str) -> str | None:
         if proc.returncode == 0 and os.path.getsize(out) > 44:
             return out
     except Exception:
+        pass
+    try:
+        os.remove(out)
+    except OSError:
         pass
     return None
