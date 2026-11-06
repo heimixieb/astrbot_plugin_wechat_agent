@@ -13,7 +13,7 @@ class FakeDaemon:
     def __init__(self):
         self.messages: dict[str, dict] = {}
         self.events: list[dict] = []  # 已经存在的(历史)事件
-        self.stream_script: list[list[dict | str]] = []  # 每次连接要推的事件；"DROP" 表示断开
+        self.stream_script: list[list[dict | str]] = []  # 每次连接要推的事件；"DROP" 断开，"LOGOUT" 变成没登录
         self.stream_calls: list[str] = []  # 每次连接的 after
         self.sends: list[dict] = []
         self.send_headers: list[dict] = []
@@ -135,6 +135,9 @@ class FakeDaemon:
         for item in script:
             if item == "DROP":
                 break
+            if item == "LOGOUT":  # 微信把号踢下线：之后查账号就是没登录
+                self.authenticated = False
+                continue
             ev = item
             await resp.write(f"id: {ev['cursor']}\ndata: {json.dumps(ev)}\n\n".encode())
             await asyncio.sleep(0.01)

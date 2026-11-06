@@ -6,7 +6,7 @@ desc: |
   群聊像真人：偶尔引用对方、撤回了就不回、先发图再 @ 也看得懂；能接微信语音电话（豆包端到端实时语音，可打断）；群里 /总结群聊；
   没登录时二维码直接打在 AstrBot 日志里扫。私聊/群聊、@ 与引用、图片/语音/视频/文件收发、防风控节流。每个功能都能在 WebUI 里单独开关。
 help: 先用 deploy/install_daemon.sh 装好 agent-wechat 守护进程，再在 WebUI「机器人 → 新增」里选「微信 (agent-wechat)」，填守护进程地址和 Token 文件，到日志里扫码。详见 README。
-version: v1.2.0
+version: v1.2.1
 author: heimixieb
 repo: https://github.com/heimixieb/astrbot_plugin_wechat_agent
 astrbot_version: ">=4.29.0"

@@ -140,6 +140,59 @@ class CallBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("call.answer", types)
 
 
+class ControlRulesTest(unittest.IsolatedAsyncioTestCase):
+    """不连服务器，直接喂控制消息看发出的命令。"""
+
+    def bridge(self, allow):
+        b = CallBridge(None, {"call_allow": allow})
+        b.sent = []
+        async def cmd(body):
+            b.sent.append(body)
+            return "r1"
+        b._cmd = cmd
+        return b
+
+    @staticmethod
+    def offer(caller, cid="k2", kind="direct"):
+        return {"type": "call.offered", "offer": {"callId": cid, "revision": 1, "kind": kind,
+                                                  "callType": "voice", "callerId": caller}}
+
+    async def test_star_allows_any_friend(self):
+        b = self.bridge(["*"])
+        await b._on_control(self.offer("wxid_friend"))
+        self.assertEqual(b.sent[0]["type"], "call.answer")
+
+    async def test_second_caller_rejected_while_busy(self):
+        b = self.bridge(["*"])
+        b._owner["k1"] = "ot"  # 正在和别人通话
+        await b._on_control(self.offer("wxid_friend"))
+        self.assertEqual(b.sent[0]["type"], "call.reject")
+        b._owner.clear()
+        b._pending_answer["r0"] = "k1"  # 刚接起、还没确认
+        await b._on_control(self.offer("wxid_friend", "k3"))
+        self.assertEqual(b.sent[1]["type"], "call.reject")
+
+    async def test_group_call_rejected(self):
+        b = self.bridge(["*"])
+        await b._on_control(self.offer("wxid_friend", kind="conference"))
+        self.assertEqual(b.sent[0]["type"], "call.reject")
+
+    async def test_no_direct_audio_reconnects_later(self):
+        # 微信掉线时 hello 不带 directAudio：断开、30 秒后重连再查；之后带上了就就绪
+        class WS:
+            closed = False
+            async def close(self):
+                self.closed = True
+        b = self.bridge([OWNER])
+        b._ctrl = WS()
+        await b._on_control({"type": "hello", "clientId": "c1", "capabilities": {}})
+        self.assertTrue(b._ctrl.closed)
+        self.assertEqual(b._retry, 30.0)
+        self.assertEqual(b.sent, [])
+        await b._on_control({"type": "hello", "clientId": "c2", "capabilities": {"directAudio": True}})
+        self.assertEqual(b.sent[0]["type"], "call.ready")
+
+
 class DownsampleTest(unittest.TestCase):
     def test_downsample_ratio(self):
         out, _ = downsample_24k_to_16k(b"\x00\x00" * 2400, None)

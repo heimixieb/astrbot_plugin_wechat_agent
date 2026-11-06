@@ -316,6 +316,26 @@ class LoopTests(Base):
         self.a._stop.set()
         await asyncio.wait_for(task, 5)
 
+    async def test_kicked_mid_stream_starts_login_at_once(self):
+        # 事件流不断、只推一条「已退出登录」：要马上回去发起扫码（不等 45 秒），登录后续传；旧的同类事件不再触发
+        self.d.messages["k1"] = msg("k1", OWNER, OWNER, 1, "重新登录后")
+        self.d.stream_script = [
+            ["LOGOUT", {"cursor": "1", "kind": "account.updated",
+                        "data": {"authentication": "logged_out", "autoLoginSuppressed": True}}],
+            [{"cursor": "2", "kind": "account.connection",
+              "data": {"state": "auth_required", "serviceCode": -13, "source": "push"}},
+             committed(3, "k1", OWNER)],
+        ]
+        async def fast(s): await asyncio.sleep(min(s, 0.05))
+        self.a._sleep = fast
+        task = asyncio.create_task(self.a._run())
+        ev = await asyncio.wait_for(self.queue.get(), 5)
+        self.a._stop.set()
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(ev.message_str, "重新登录后")
+        self.assertEqual(len(self.d.login_bodies), 1)
+        self.assertEqual(self.d.stream_calls[1], "1")
+
     async def test_bad_token_reports_error_and_retries(self):
         open(self.token_file, "w").write("wrong")
         with self.assertRaises(WeChatApiError) as cm:

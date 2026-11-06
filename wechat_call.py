@@ -38,7 +38,7 @@ def downsample_24k_to_16k(pcm: bytes, state):
 class CallBridge:
     def __init__(self, client, cfg: dict) -> None:
         self.client = client  # WeChatClient（复用 base_url / token / account_id）
-        self.allow = {str(x) for x in (cfg.get("call_allow") or [])}
+        self.allow = {str(x) for x in (cfg.get("call_allow") or [])}  # 含 "*" = 所有好友
         self.voice = str(cfg.get("call_voice") or "zh_female_xiaohe_jupiter_bigtts")
         self.speech_rate = int(cfg.get("call_speech_rate", 0))  # 豆包 speech_rate：-50~100，0 正常，100 = 2 倍速
         self.greeting = str(cfg.get("call_greeting") or "喂？你好呀～")
@@ -54,6 +54,8 @@ class CallBridge:
         self._pending_answer: dict[str, str] = {}  # requestId -> callId
         self._generation: dict[str, asyncio.Queue] = {}  # callId -> 新 send generation
         self._revision: dict[str, int] = {}  # callId -> 最新 revision（挂断要带）
+        self._retry = 5.0  # 控制连接断开后多久重连
+        self._no_audio_logged = False
 
     # --------------------------------------------------------------- control
     def _ws_url(self, suffix: str) -> str:
@@ -80,7 +82,8 @@ class CallBridge:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[wechat_call] 通话控制连接中断: {type(e).__name__}: {e}")
             self._ctrl = None
-            await asyncio.sleep(5)
+            await asyncio.sleep(self._retry)
+            self._retry = 5.0
 
     async def stop(self) -> None:
         self._stop.set()
@@ -103,19 +106,35 @@ class CallBridge:
                 await self._cmd({"type": "call.ready", "ready": True,
                                  "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
                                  "scope": {"kind": "all"}})
-                logger.info(f"[wechat_call] 语音通话已就绪，允许来电: {sorted(self.allow) or '无'}")
+                self._no_audio_logged = False
+                allow = "所有好友" if "*" in self.allow else (sorted(self.allow) or "无")
+                logger.info(f"[wechat_call] 语音通话已就绪，允许来电: {allow}")
             else:
-                logger.warning("[wechat_call] 守护进程不支持语音通话（capabilities 无 directAudio）")
+                # 微信掉线时守护进程也这样回；重新登录后不会再发 hello，所以断开重连、隔一阵再查
+                if not self._no_audio_logged:
+                    self._no_audio_logged = True
+                    logger.warning("[wechat_call] 守护进程现在接不了电话（capabilities 无 directAudio，微信没登录时也这样），每 30 秒重查一次")
+                self._retry = 30.0
+                if self._ctrl is not None:
+                    await self._ctrl.close()
         elif t == "call.offered":
             offer = ev.get("offer") or {}
             cid, caller = str(offer.get("callId")), str(offer.get("callerId"))
-            if offer.get("callType") == "voice" and caller in self.allow:
+            if offer.get("callType") != "voice" or offer.get("kind", "direct") != "direct":
+                reason = "不是一对一语音"
+            elif not ("*" in self.allow or caller in self.allow):
+                reason = "不在 call_allow"
+            elif self._owner or self._pending_answer:
+                reason = "正在和别人通话"
+            else:
+                reason = ""
+            if not reason:
                 logger.info(f"[wechat_call] 接听来电 {caller}")
                 rid = await self._cmd({"type": "call.answer", "callId": cid,
                                        "expectedRevision": offer.get("revision")})
                 self._pending_answer[rid] = cid
             else:
-                logger.info(f"[wechat_call] 拒接来电 {caller}（不在 call_allow 或非语音）")
+                logger.info(f"[wechat_call] 拒接来电 {caller}（{reason}）")
                 await self._cmd({"type": "call.reject", "callId": cid, "expectedRevision": offer.get("revision")})
         elif t == "command.result":
             cid = self._pending_answer.pop(str(ev.get("requestId")), None)

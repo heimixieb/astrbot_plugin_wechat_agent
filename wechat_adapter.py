@@ -82,7 +82,7 @@ DEFAULT_CONFIG = {
     "parse_share_card": True,  # 分享卡片 / 聊天记录转文字
     "split_long_voice": True,  # 超过 55 秒的语音切成几条
     "call_enable": False,  # 微信语音来电 → 豆包实时语音（需守护进程 ≥1.4.0、环境变量 DOUBAO_REALTIME_API_KEY）
-    "call_allow": [],  # 允许接听的来电 wxid
+    "call_allow": [],  # 允许接听的来电 wxid；填 "*" = 所有好友
     "call_voice": "zh_female_xiaohe_jupiter_bigtts",
     "call_speech_rate": 0,  # 电话语速 -50~100，0 正常，100 = 2 倍速
     "call_greeting": "喂？你好呀～",
@@ -125,7 +125,8 @@ CONFIG_METADATA = {
                          "hint": "微信语音最长 60 秒，超过 55 秒的按换气停顿切成几条发。关掉后超长语音会发送失败。"},
     "call_enable": {"description": "接听语音电话", "type": "bool",
                     "hint": "白名单里的人打来微信语音，自动接到豆包端到端实时语音。需要守护进程 ≥1.4.0 和豆包 API Key（见下面的环境变量名）。"},
-    "call_allow": {"description": "允许来电的 wxid", "type": "list", "hint": "其他人打来自动拒接。"},
+    "call_allow": {"description": "允许来电的 wxid", "type": "list",
+                   "hint": "其他人打来自动拒接。填一个 * 就是所有好友都能打。同一时间只接一个人，通话中别人打来会拒接。"},
     "call_voice": {"description": "电话音色", "type": "string", "hint": "豆包音色 id，也可以填自己复刻的 S_ 开头音色。"},
     "call_speech_rate": {"description": "电话语速", "type": "int", "hint": "-50~100，0 正常，100 = 2 倍速。"},
     "call_greeting": {"description": "接通第一句", "type": "string"},
@@ -400,6 +401,8 @@ class WeChatAgentAdapter(Platform):
                         await self.client.ack(self.consumer, cur)
                     except Exception:
                         pass
+                if await self._kicked(event):
+                    return  # 回主循环重新查登录状态，没登录就发起扫码
         except WeChatApiError as e:
             if e.code == "event_cursor_expired":
                 logger.warning("[wechat_agent] 事件游标过期，重置到最新")
@@ -410,6 +413,24 @@ class WeChatAgentAdapter(Platform):
                     pass
                 return
             raise
+
+    async def _kicked(self, event: dict) -> bool:
+        """守护进程报告微信登录掉了（被踢、登录被微信拒绝）。事件流本身不会断，不看这个就会一直干等。"""
+        data = event.get("data") or {}
+        kind = event.get("kind")
+        if not ((kind == "account.updated" and data.get("authentication") == "logged_out")
+                or (kind == "account.connection" and data.get("state") == "auth_required")):
+            return False
+        # 掉线时这两种事件会连着来，重新登录后续传到的是旧的那条，以守护进程当前状态为准
+        if (await self.client.resolve_account()).get("authenticated"):
+            return False
+        code = data.get("serviceCode")
+        logger.warning(f"[wechat_agent] 微信登录掉了（{f'服务码 {code}' if code is not None else '已退出登录'}）"
+                       + ("，马上发起扫码登录" if self.auto_login else "，请重新扫码登录"))
+        if data.get("autoLoginSuppressed") or kind == "account.connection":
+            # 守护进程不会再自己重连，不用等 LOGIN_GRACE_SECONDS
+            self._unauth_since = time.monotonic() - LOGIN_GRACE_SECONDS
+        return True
 
     # ------------------------------------------------------------ inbound
     async def handle_event(self, event: dict) -> AstrBotMessage | None:
