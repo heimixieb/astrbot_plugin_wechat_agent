@@ -156,6 +156,8 @@ class InboundTests(Base):
     async def test_media_unavailable_degrades(self):
         abm = await self.feed(msg("m11", OWNER, OWNER, 3))  # 没有 assets
         self.assertIn("下载失败", abm.message_str)
+        abm = await self.feed(msg("m11b", OWNER, OWNER, 47))  # 下不来的表情
+        self.assertEqual(abm.message_str, "[表情包]")
 
     async def test_link_card_becomes_text_with_url_line(self):
         link = {"title": "猫猫视频", "description": "超可爱", "url": "https://b23.tv/abc", "sourceName": "哔哩哔哩"}

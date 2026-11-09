@@ -571,7 +571,8 @@ class WeChatAgentAdapter(Platform):
                 if is_group and self.attach_recent_image:
                     self._recent_image[(thread_id, sender_id)] = (path, abm.timestamp)
             else:
-                text = "[图片(下载失败)]"
+                # 群友的表情大多下不来（守护进程只放行两个 CDN），标成表情包，免得她以为有张图没收到
+                text = "[表情包]" if mtype == 47 else "[图片(下载失败)]"
                 chain.append(Plain(text))
         elif mtype == 34:
             path = await self._fetch_media(msg, kind="voice")
