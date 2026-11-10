@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import random
 import re
@@ -46,10 +47,10 @@ from astrbot.core.platform.platform import PlatformStatus
 from .wechat_call import CallBridge
 from .wechat_client import SUCCESS_JOB_STATES, WeChatApiError, WeChatClient
 from .wechat_event import WeChatAgentMessageEvent
-from .wechat_media import VOICE_MAX_SECONDS, audio_duration_ms, prepare_image_bytes, qr_modules, qr_text, split_voice, to_wav
+from .wechat_media import VOICE_MAX_SECONDS, audio_duration_ms, is_big_photo, prepare_image_bytes, qr_modules, qr_text, split_voice, to_wav
 
 ADAPTER_NAME = "wechat_agent"
-SUPPORTED_TYPES = {1, 3, 34, 47, 49}
+SUPPORTED_TYPES = {1, 3, 34, 43, 47, 49}
 # 49 类应用消息里按文字处理的：分享文字(1)、聊天记录合并转发(19)、引用回复(57)、群公告(87)；带 link 的卡片另算
 APP_TEXT_TYPES = {1, 19, 57, 87, None}
 _MENTION_PREFIX = re.compile(r"^(?:@[^\s\u2005\u00a0]+[\u2005\u00a0 ]+)+")
@@ -57,6 +58,8 @@ LOGIN_QR_FILE = "login_qr.png"
 # 登录操作的结束状态（和 wx auth login 一致）
 LOGIN_GRACE_SECONDS = 45  # 发现没登录后先等这么久，让守护进程自己重连
 LOGIN_DONE = {"succeeded", "failed", "cancelled", "expired", "rejected", "needs_login", "approval_required", "challenge_required"}
+PUSHPLUS_URL = "https://www.pushplus.plus/send"
+NOTIFY_GAP_SECONDS = 600  # 同一类「要你动手」的推送（扫码 / 手机确认）最多 10 分钟一条
 
 DEFAULT_CONFIG = {
     "id": "wechat",
@@ -80,6 +83,9 @@ DEFAULT_CONFIG = {
     "attach_recent_image": True,  # 先发图再 @ 机器人时把图带上
     "recent_image_seconds": 180,
     "parse_share_card": True,  # 分享卡片 / 聊天记录转文字
+    "watch_video": True,  # 被 @ 时看引用的 / 刚发的视频，私聊视频直接看
+    "send_image_original": True,  # 大图另附一份原图文件（守护进程发图会压到 64KB）
+    "notify_pushplus_token": "",  # 掉线时推送到手机（PushPlus token，留空 = 不推）
     "split_long_voice": True,  # 超过 55 秒的语音切成几条
     "call_enable": False,  # 微信语音来电 → 豆包实时语音（需守护进程 ≥1.4.0、环境变量 DOUBAO_REALTIME_API_KEY）
     "call_allow": [],  # 允许接听的来电 wxid；填 "*" = 所有好友
@@ -121,6 +127,12 @@ CONFIG_METADATA = {
     "recent_image_seconds": {"description": "带图时限（秒）", "type": "int", "hint": "发图后多少秒内 @ 才算在说这张图。"},
     "parse_share_card": {"description": "分享卡片转文字", "type": "bool",
                          "hint": "文章/视频/音乐/视频号分享转成「标题 + 简介 + 网址」，聊天记录合并转发转成「谁：说了什么」。关掉就忽略这类消息。"},
+    "watch_video": {"description": "看视频", "type": "bool",
+                    "hint": "私聊发来的视频直接交给机器人看；群里只在有人 @ 机器人并引用视频、或发完视频不久就 @ 机器人时才看（看视频要抽帧识别，比较费钱）。其余群视频只告诉机器人「[视频]」。需要能理解视频的插件（如 face_convert）。"},
+    "send_image_original": {"description": "大图附原图文件", "type": "bool",
+                            "hint": "守护进程发图会把每张图压到 64KB 以内（大图会糊）。打开后，长边 ≥1600 的静态大图（比如 AI 画的图）在正常发图之后再发一份原图文件，想看高清的点文件。"},
+    "notify_pushplus_token": {"description": "掉线推送（PushPlus token）", "type": "string", "secret": True,
+                              "hint": "微信掉线、需要扫码/确认、重新上线时，通过 PushPlus（pushplus.plus，关注公众号即可拿 token）推送到手机，扫码时连二维码一起推。留空不推。"},
     "split_long_voice": {"description": "长语音自动切段", "type": "bool",
                          "hint": "微信语音最长 60 秒，超过 55 秒的按换气停顿切成几条发。关掉后超长语音会发送失败。"},
     "call_enable": {"description": "接听语音电话", "type": "bool",
@@ -172,6 +184,9 @@ class WeChatAgentAdapter(Platform):
         self.attach_recent_image = bool(cfg.get("attach_recent_image", True))
         self.recent_image_seconds = float(cfg.get("recent_image_seconds", 180))
         self.parse_share_card = bool(cfg.get("parse_share_card", True))
+        self.watch_video = bool(cfg.get("watch_video", True))
+        self.send_image_original = bool(cfg.get("send_image_original", True))
+        self.notify_token = str(cfg.get("notify_pushplus_token") or "").strip()
         self.split_long_voice = bool(cfg.get("split_long_voice", True))
         self._send_lock = asyncio.Lock()
         self._last_send = 0.0
@@ -201,6 +216,13 @@ class WeChatAgentAdapter(Platform):
         self._recalled: deque[str] = deque(maxlen=500)
         # 微信图文不能同条发：群里每人最近发的一张图 (路径, 时间)，紧接着 @ 机器人时带上
         self._recent_image: dict[tuple[str, str], tuple[str, float]] = {}
+        # 群里每人最近发的一个视频（原消息, 时间）：不先下载，等他 @ 机器人时才下载来看
+        self._recent_video: dict[tuple[str, str], tuple[dict, float]] = {}
+        # 掉线推送：掉线原因、这次掉线是否推过、上次推二维码 / 手机确认的时间
+        self.notify_url = PUSHPLUS_URL
+        self._outage_reason = ""
+        self._outage_notified = False
+        self._last_push = {"qr": -NOTIFY_GAP_SECONDS, "approval": -NOTIFY_GAP_SECONDS}
         self.calls = CallBridge(self.client, cfg) if cfg.get("call_enable") else None
         self._call_task: asyncio.Task | None = None
 
@@ -345,8 +367,23 @@ class WeChatAgentAdapter(Platform):
                 mods = qr_modules(png)
                 art = "\n" + qr_text(mods) if mods else ""
                 logger.warning(f"[wechat_agent] 微信未登录，请用手机微信扫下面的二维码（约 2 分钟换一张），图片也存在 {qr_path}{art}")
+                if self._push_due("qr"):
+                    img = base64.b64encode(png).decode()
+                    await self._notify(
+                        "微信掉线了，请扫码登录",
+                        f"<p>{self._outage_reason or '微信没登录'}。</p>"
+                        "<p>用机器人那个微信号的手机扫下面的二维码，扫完在手机上点「登录」。"
+                        "二维码约 2 分钟换一张，过期了等下一条推送（最多 10 分钟一条）。</p>"
+                        f'<p><img src="data:image/png;base64,{img}" style="width:260px"></p>',
+                    )
             if state == "awaiting_approval" and not approval:
                 logger.warning("[wechat_agent] 已扫码，请在手机微信上点「登录」确认")
+                # 刚推过二维码说明是扫码后的确认，人就在手机前，不用再推
+                if time.monotonic() - self._last_push["qr"] > 300 and self._push_due("approval"):
+                    await self._notify(
+                        "微信要你在手机上确认登录",
+                        f"<p>{self._outage_reason or '微信没登录'}。请在机器人那个微信号的手机上点「登录」确认。</p>",
+                    )
             approval = state == "awaiting_approval"
             if result.get("lanChallenge") == "waiting_for_phone" and not lan:
                 lan = True
@@ -360,9 +397,34 @@ class WeChatAgentAdapter(Platform):
             pass
         if state == "succeeded":
             logger.info("[wechat_agent] 微信登录成功")
+            if self._outage_notified:
+                await self._notify("微信重新上线了", "<p>机器人的微信已经重新登录，消息恢复正常。</p>")
+            self._outage_reason, self._outage_notified = "", False
         else:
             logger.warning(f"[wechat_agent] 这次登录没成功（{state or '超时'}），30 秒后重新发起")
             await self._sleep(30)
+
+    def _push_due(self, kind: str) -> bool:
+        """这一类推送离上次够 10 分钟了没有；够了就记下这次的时间。"""
+        if not self.notify_token or time.monotonic() - self._last_push[kind] < NOTIFY_GAP_SECONDS:
+            return False
+        self._last_push[kind] = time.monotonic()
+        return True
+
+    async def _notify(self, title: str, html: str) -> None:
+        """掉线相关的事推送到手机（PushPlus）。没配 token 就不推；推送失败只记日志，不影响登录。"""
+        if not self.notify_token:
+            return
+        self._outage_notified = True
+        body = {"token": self.notify_token, "title": f"[{self.metadata.id}] {title}", "content": html, "template": "html"}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(self.notify_url, json=body, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json(content_type=None)
+            if not isinstance(data, dict) or data.get("code") != 200:
+                logger.warning(f"[wechat_agent] 掉线推送没成功: {str(data)[:200]}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[wechat_agent] 掉线推送失败: {type(e).__name__}: {e}")
 
     def _load_cursor(self) -> str:
         try:
@@ -425,8 +487,11 @@ class WeChatAgentAdapter(Platform):
         if (await self.client.resolve_account()).get("authenticated"):
             return False
         code = data.get("serviceCode")
-        logger.warning(f"[wechat_agent] 微信登录掉了（{f'服务码 {code}' if code is not None else '已退出登录'}）"
+        self._outage_reason = f"微信登录掉了（{f'服务码 {code}' if code is not None else '已退出登录'}）"
+        logger.warning(f"[wechat_agent] {self._outage_reason}"
                        + ("，马上发起扫码登录" if self.auto_login else "，请重新扫码登录"))
+        if not self.auto_login:  # 开着自动登录时，等出了二维码 / 要手机确认再推，一条就够
+            await self._notify("微信掉线了", f"<p>{self._outage_reason}，请重新扫码登录。</p>")
         if data.get("autoLoginSuppressed") or kind == "account.connection":
             # 守护进程不会再自己重连，不用等 LOGIN_GRACE_SECONDS
             self._unauth_since = time.monotonic() - LOGIN_GRACE_SECONDS
@@ -535,13 +600,20 @@ class WeChatAgentAdapter(Platform):
         if is_group and at_all:
             chain.append(AtAll())
 
+        # 这条消息是不是在跟机器人说话：私聊、@ 了她、或者她刚在这个群说过话（引用视频「你看这个」常不 @）
+        talking_to_me = not is_group or at_self or self._just_spoke(thread_id)
+        video_path: str | None = None
         quote = msg.get("quote")
         if quote:
             qtext = quote.get("embeddedText") or _link_text(quote.get("embeddedLink"))
             qsender = self.own_id if quote.get("direction") == "outgoing" else str(quote.get("senderId") or "")
+            if quote.get("type") == 43:
+                qtext = qtext or "[视频]"  # 守护进程不内嵌视频（state=unsupported），只给原消息的 serverId
+                if self.watch_video and talking_to_me:
+                    video_path = await self._quoted_media(thread_id, str(quote.get("serverId") or ""), (43,), "video")
             qchain: list[BaseMessageComponent] = [Plain(qtext)] if qtext else []
             if quote.get("type") == 3 and quote.get("embeddedImage"):
-                qimg = await self._quoted_image(thread_id, str(quote.get("serverId") or ""))
+                qimg = await self._quoted_media(thread_id, str(quote.get("serverId") or ""), (3, 47), "image")
                 if qimg:
                     qchain.append(Image.fromFileSystem(qimg))
             chain.append(
@@ -581,6 +653,15 @@ class WeChatAgentAdapter(Platform):
             else:
                 text = "[语音(下载失败)]"
                 chain.append(Plain(text))
+        elif mtype == 43:
+            # 看视频要抽帧识别、比较费钱：群里先只记下来，等他 @ 机器人时再下载
+            if self.watch_video and not is_group:
+                video_path = await self._fetch_media(msg, kind="video")
+            elif self.watch_video:
+                self._recent_video[(thread_id, sender_id)] = (msg, abm.timestamp)
+            if not video_path:
+                text = "[视频]"
+                chain.append(Plain(text))
 
         if is_group and mentions.get("state") == "known":
             for uid in mentions.get("userIds") or []:
@@ -593,21 +674,34 @@ class WeChatAgentAdapter(Platform):
             quoted_img = any(isinstance(c, Reply) and any(isinstance(x, Image) for x in c.chain) for c in chain)
             if recent and not quoted_img and abm.timestamp - recent[1] <= self.recent_image_seconds and os.path.exists(recent[0]):
                 chain.append(Image.fromFileSystem(recent[0]))
+        # 先发视频再 @ 她「你看这个」：同样只认这个人刚发的、只带一次
+        if self.watch_video and is_group and at_self and mtype != 43 and not video_path:
+            recent_v = self._recent_video.pop((thread_id, sender_id), None)
+            if recent_v and abm.timestamp - recent_v[1] <= self.recent_image_seconds:
+                video_path = await self._fetch_media(recent_v[0], kind="video")
+        # 视频放在主消息链里：理解视频的插件只看顶层消息段
+        if video_path:
+            chain.append(Video.fromFileSystem(video_path))
 
         abm.message = chain
         abm.message_str = text
         return abm
 
-    async def _quoted_image(self, thread_id: str, server_id: str) -> str | None:
-        """引用的图片：按 serverId 在本会话里找到原消息再下载，画图插件会把它当参考图。"""
+    def _just_spoke(self, thread_id: str, seconds: float = 180) -> bool:
+        """机器人最近几分钟在这个群说过话（这时群友引用东西给她看，多半是接着跟她聊）。"""
+        now = time.monotonic()
+        return any(from_self and now - t <= seconds for _, from_self, t in self._thread_log.get(thread_id) or [])
+
+    async def _quoted_media(self, thread_id: str, server_id: str, types: tuple[int, ...], kind: str) -> str | None:
+        """引用的图片/视频：按 serverId 在本会话里找到原消息再下载（画图插件拿图当参考图，看视频插件拿视频）。"""
         if not server_id:
             return None
         try:
             for m in await self.client.thread_messages(thread_id):
-                if str(m.get("serverId")) == server_id and m.get("type") in (3, 47):
-                    return await self._fetch_media(m, "image")
+                if str(m.get("serverId")) == server_id and m.get("type") in types:
+                    return await self._fetch_media(m, kind)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[wechat_agent] 引用图片获取失败: {type(e).__name__}: {e}")
+            logger.warning(f"[wechat_agent] 引用{'视频' if kind == 'video' else '图片'}获取失败: {type(e).__name__}: {e}")
         return None
 
     async def _fetch_media(self, msg: dict, kind: str) -> str | None:
@@ -617,8 +711,9 @@ class WeChatAgentAdapter(Platform):
         try:
             asset = _select_asset(await self.client.media_assets(mid), kind)
             if asset is None:
-                job = await self.client.transfer_media(mid, "normal" if kind == "voice" else "best")
-                job = await self.client.wait_job(job, self.media_wait)
+                job = await self.client.transfer_media(mid, "normal" if kind in ("voice", "video") else "best")
+                # 视频比图片大得多，至少等一分钟
+                job = await self.client.wait_job(job, max(self.media_wait, 60) if kind == "video" else self.media_wait)
                 asset = _select_asset(await self.client.media_assets(mid), kind)
             if asset is None:
                 logger.warning(f"[wechat_agent] 媒体不可用 message={mid[:24]} kind={kind}")
@@ -763,7 +858,26 @@ class WeChatAgentAdapter(Platform):
                 await self._send_voice_parts(thread_id, comp)
                 continue
             await self._paced(lambda: self._send_component(thread_id, comp))
+            if isinstance(comp, Image) and self.send_image_original:
+                await self._send_original_if_big(thread_id, comp)
         await flush()
+
+    async def _send_original_if_big(self, thread_id: str, comp: Image) -> None:
+        """守护进程发图会压到 64KB 以内，AI 画的大图会糊：再发一份原图文件。失败不影响已发出的图。"""
+        try:
+            raw, path = await self._component_bytes(comp)
+            if not is_big_photo(raw):
+                return
+            # 上传时中文文件名会被百分号编码，对方看到一串乱码，所以用英文名
+            name = "HD_original" + (os.path.splitext(path)[1] or ".png")
+
+            async def send() -> None:
+                src = await self.client.upload(raw, name, "application/octet-stream")
+                await self._finish_job(await self.client.send_media(thread_id, "file", src["id"]), "file", timeout=600)
+
+            await self._paced(send)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[wechat_agent] 原图文件发送失败（图已发出）: {type(e).__name__}: {e}")
 
     async def _send_text(self, thread_id: str, text: str, quote_comp: Reply | None, mention_ids: list[str], mention_all: bool) -> None:
         quote = await self._resolve_quote(quote_comp) if quote_comp else None
@@ -891,10 +1005,15 @@ def _flatten(comps):
 
 def _select_asset(assets: list[dict], kind: str) -> dict | None:
     ok = [a for a in assets if a.get("state") == "available"]
+    if kind == "video":
+        # 视频的缩略图是张图片，不能拿来当视频
+        ok = [a for a in ok if (a.get("actualVariant") or a.get("variant")) != "thumbnail"]
     if not ok:
         return None
     if kind == "voice":
         pref = ["normal"]
+    elif kind == "video":
+        pref = ["normal", "original"]
     else:
         pref = ["original", "standard", "thumbnail", "encoded"]
 
@@ -915,6 +1034,7 @@ def _ext_for(ctype: str, filename: str | None, kind: str, data: bytes) -> str:
         "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
         "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
         "audio/ogg": ".ogg", "audio/silk": ".silk", "audio/x-silk": ".silk",
+        "video/mp4": ".mp4", "video/quicktime": ".mov",
     }
     if ct in table:
         return table[ct]

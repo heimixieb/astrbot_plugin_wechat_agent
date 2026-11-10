@@ -38,6 +38,17 @@ def prepare_image_bytes(data: bytes, name: str = "image") -> tuple[bytes, str, s
         return data, os.path.basename(name) or "image", ctype
 
 
+def is_big_photo(data: bytes, min_edge: int = 1600) -> bool:
+    """长边够大的静态图（AI 画的图这类）：守护进程压到 64KB 后会明显变糊。表情包、动图不算。"""
+    from PIL import Image
+
+    try:
+        im = Image.open(io.BytesIO(data))
+        return not getattr(im, "is_animated", False) and max(im.size) >= min_edge
+    except Exception:
+        return False
+
+
 def qr_modules(png: bytes) -> list[list[bool]] | None:
     """守护进程给的登录二维码 PNG → 模块矩阵（True=黑）。按左上角定位块（7 个模块宽）量出模块大小再逐格取样。"""
     try:

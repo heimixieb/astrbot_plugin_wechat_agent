@@ -10,7 +10,7 @@ import wave
 from PIL import Image as PILImage
 
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Image, Plain, Record, Reply
+from astrbot.api.message_components import At, Image, Plain, Record, Reply, Video
 from astrbot.api.platform import MessageType
 from astrbot.core.message.components import AtAll
 from astrbot.core import astrbot_config
@@ -436,6 +436,123 @@ class QuotedImageTest(Base):
         m2["mentions"].update(self=True, userIds=[BOT])
         abm = await self.feed(m2)  # 只带一次
         self.assertFalse(any(isinstance(c, Image) for c in abm.message))
+
+
+class VideoTest(Base):
+    def add_video(self, mid):
+        self.d.assets[mid] = [
+            {"id": f"{mid}_t", "state": "available", "variant": "thumbnail", "actualVariant": "thumbnail", "contentType": "image/jpeg", "kind": "video"},
+            {"id": f"{mid}_n", "state": "available", "variant": "normal", "actualVariant": "normal", "contentType": "video/mp4", "kind": "video"}]
+        self.d.content[f"{mid}_n"] = (b"fake-mp4-" + mid.encode(), "video/mp4")
+        self.d.content[f"{mid}_t"] = (b"\xff\xd8\xff thumb", "image/jpeg")
+
+    def at_me(self, m):
+        m["mentions"].update(self=True, userIds=[BOT])
+        return m
+
+    async def video_of(self, abm):
+        vids = [c for c in abm.message if isinstance(c, Video)]
+        if not vids:
+            return None
+        path = await vids[0].convert_to_file_path()
+        return open(path, "rb").read()
+
+    async def test_group_video_only_watched_when_sender_ats(self):
+        g = "g1@chatroom"
+        self.add_video("v1")
+        abm = await self.feed(msg("v1", g, "wxid_bob", 43))
+        self.assertEqual(abm.message_str, "[视频]")  # 群里普通视频不下载、不分析
+        self.assertIsNone(await self.video_of(abm))
+        abm = await self.feed(self.at_me(msg("v1a", g, "wxid_alice", 1, "@大肥鱼 在吗")))
+        self.assertIsNone(await self.video_of(abm))  # 别人 @ 不带 bob 的视频
+        abm = await self.feed(self.at_me(msg("v1b", g, "wxid_bob", 1, "@大肥鱼 你看这个")))
+        self.assertEqual(await self.video_of(abm), b"fake-mp4-v1")  # 不能拿成缩略图
+        abm = await self.feed(self.at_me(msg("v1c", g, "wxid_bob", 1, "@大肥鱼 好笑吗")))
+        self.assertIsNone(await self.video_of(abm))  # 只带一次
+
+    async def test_quoted_video(self):
+        g = "g1@chatroom"
+        orig = msg("v2", g, "wxid_bob", 43)
+        self.d.messages["v2"] = orig
+        self.add_video("v2")
+        q = {"serverId": orig["serverId"], "type": 43, "state": "unsupported", "senderId": "wxid_bob", "embeddedText": None}
+        abm = await self.feed(msg("q1", g, "wxid_alice", 49, "你看这个", appMessageType=57, quote=dict(q)))
+        self.assertIsNone(await self.video_of(abm))  # 没 @ 她、她也没在聊：不看
+        rep = next(c for c in abm.message if isinstance(c, Reply))
+        self.assertEqual(rep.message_str, "[视频]")
+        abm = await self.feed(self.at_me(msg("q2", g, "wxid_alice", 49, "@大肥鱼 你看这个", appMessageType=57, quote=dict(q))))
+        self.assertEqual(await self.video_of(abm), b"fake-mp4-v2")
+        await self.a.send_chain(g, MessageChain([Plain("啥")]))  # 她刚说过话：不 @ 也算在跟她聊
+        abm = await self.feed(msg("q3", g, "wxid_alice", 49, "就这个", appMessageType=57, quote=dict(q)))
+        self.assertEqual(await self.video_of(abm), b"fake-mp4-v2")
+
+    async def test_private_video_watched_directly(self):
+        self.add_video("v3")
+        abm = await self.feed(msg("v3", OWNER, OWNER, 43))
+        self.assertEqual(await self.video_of(abm), b"fake-mp4-v3")
+
+    async def test_watch_video_off(self):
+        self.a.watch_video = False
+        self.add_video("v4")
+        abm = await self.feed(msg("v4", OWNER, OWNER, 43))
+        self.assertEqual(abm.message_str, "[视频]")
+        self.assertIsNone(await self.video_of(abm))
+
+
+class OriginalImageFileTest(Base):
+    def png_file(self, w, h):
+        path = os.path.join(self.tmp, f"img_{w}x{h}.png")
+        PILImage.new("RGB", (w, h), "blue").save(path)
+        return path
+
+    async def test_big_image_also_sent_as_file(self):
+        await self.a.send_chain(OWNER, MessageChain([Image.fromFileSystem(self.png_file(2048, 1024))]))
+        self.assertEqual([s["kind"] for s in self.d.sends], ["image", "file"])
+        self.assertEqual(self.d.uploads[-1]["name"], "HD_original.png")
+
+    async def test_small_image_or_switch_off_only_image(self):
+        await self.a.send_chain(OWNER, MessageChain([Image.fromFileSystem(self.png_file(400, 400))]))
+        self.a.send_image_original = False
+        await self.a.send_chain(OWNER, MessageChain([Image.fromFileSystem(self.png_file(2048, 2048))]))
+        self.assertEqual([s["kind"] for s in self.d.sends], ["image", "image"])
+
+
+class NotifyTest(Base):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+
+        async def no_sleep(_):
+            return None
+        self.a._sleep = no_sleep
+        self.a.notify_token = "tok"
+        self.a.notify_url = f"http://127.0.0.1:{self.d.port}/pushplus"
+        self.d.authenticated = False
+
+    async def test_qr_push_then_back_online(self):
+        self.d.qr_png = qr_png(fake_modules())
+        self.d.login_states = ["awaiting_approval", "succeeded"]
+        self.a._outage_reason = "微信登录掉了（服务码 -13）"
+        await self.a._login()
+        titles = [p["title"] for p in self.d.pushes]
+        self.assertEqual(titles, ["[wechat] 微信掉线了，请扫码登录", "[wechat] 微信重新上线了"])  # 扫码后的确认不再推
+        self.assertIn("服务码 -13", self.d.pushes[0]["content"])
+        self.assertIn("data:image/png;base64,", self.d.pushes[0]["content"])
+        self.assertEqual(self.d.pushes[0]["token"], "tok")
+
+    async def test_phone_approval_push_and_rate_limit(self):
+        self.d.qr_available = False
+        self.d.login_states = ["awaiting_approval", "failed"]
+        await self.a._login()
+        self.d.login_states = ["awaiting_approval", "failed"]
+        await self.a._login()  # 10 分钟内同类不重复推
+        self.assertEqual([p["title"] for p in self.d.pushes], ["[wechat] 微信要你在手机上确认登录"])
+
+    async def test_no_token_no_push(self):
+        self.a.notify_token = ""
+        self.d.qr_png = qr_png(fake_modules())
+        self.d.login_states = ["succeeded"]
+        await self.a._login()
+        self.assertEqual(self.d.pushes, [])
 
 
 class QuoteProbabilityTest(Base):

@@ -36,6 +36,8 @@ class FakeDaemon:
         self.login_states = ["succeeded"]  # 每次查登录进度依次返回的状态
         self.qr_png = b""
         self.qr_fetches: list[str] = []
+        self.qr_available = True  # False = 免扫码登录，直接等手机确认
+        self.pushes: list[dict] = []  # 收到的 PushPlus 推送
         self.runner = None
         self.port = 0
 
@@ -66,11 +68,12 @@ class FakeDaemon:
         r.add_get(f"/v1/accounts/{ACC}/groups/{{gid}}/lookup", self.lookup_group)
         r.add_get(f"/v1/accounts/{ACC}/avatars/{{uid}}", self.avatar)
         r.add_post(f"/v1/accounts/{ACC}/avatars/{{uid}}/refresh", self.avatar_refresh)
+        r.add_post("/pushplus", self.pushplus)
         return app
 
     @web.middleware
     async def auth(self, request, handler):
-        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+        if request.path != "/pushplus" and request.headers.get("Authorization") != f"Bearer {TOKEN}":
             return web.json_response({"error": {"code": "unauthorized"}}, status=401)
         return await handler(request)
 
@@ -94,14 +97,18 @@ class FakeDaemon:
     async def login(self, req):
         self.login_bodies.append(await req.json())
         return web.json_response({"id": "op1", "kind": "login", "state": "running",
-                                  "result": {"qrAvailable": True, "qrGeneration": 1}}, status=202)
+                                  "result": {"qrAvailable": self.qr_available, "qrGeneration": 1}}, status=202)
 
     async def operation(self, req):
         state = self.login_states.pop(0) if self.login_states else "succeeded"
         if state == "succeeded":
             self.authenticated = True
         return web.json_response({"id": req.match_info["oid"], "kind": "login", "state": state,
-                                  "result": {"qrAvailable": True, "qrGeneration": 1}})
+                                  "result": {"qrAvailable": self.qr_available, "qrGeneration": 1}})
+
+    async def pushplus(self, req):
+        self.pushes.append(await req.json())
+        return web.json_response({"code": 200, "msg": "ok"})
 
     async def qr(self, req):
         self.qr_fetches.append(req.query.get("generation", ""))

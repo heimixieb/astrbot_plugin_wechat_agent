@@ -61,6 +61,8 @@ services:
 | 先发图再 @ 时带上图 `attach_recent_image` | 微信图文不能同条发：群里有人发图后 3 分钟内（`recent_image_seconds`）又 @ 机器人，把他刚发的图带进这条，看图、改图插件都能拿到 |
 | 分享卡片转文字 `parse_share_card` | 文章/视频/音乐/视频号分享转成「标题 + 简介 + 网址」（网址单独一行，链接解析插件能认）；聊天记录合并转发转成「谁：说了什么」 |
 | 长语音自动切段 `split_long_voice` | 微信语音最长 60 秒，超过 55 秒的按换气停顿切成几条发 |
+| 看视频 `watch_video` | 私聊视频直接交给机器人；群里只在有人 @ 机器人并引用视频、发完视频 3 分钟内 @ 机器人、或机器人刚在聊时引用视频，才下载来看（看视频要抽帧识别，费钱），其余群视频只给一个「[视频]」。需要会理解视频的插件 |
+| 大图附原图文件 `send_image_original` | agent-wechat 发图会把每张图压到 64KB 以内，大图会糊；长边 ≥1600 的静态大图（比如 AI 画的图）发完后再发一份原图文件 |
 | 下载图片和语音 `download_media` | 收到的图片、语音下载下来交给 AstrBot（语音自动转 wav，方便语音识别） |
 | 防风控节流 | 所有发送串行，条间随机 2~4 秒（`send_min_interval` / `send_max_interval`）、每分钟最多 12 条（`send_max_per_minute`，0 = 不限），等守护进程真正发出再发下一条 |
 | 旧消息不回 `max_message_age_seconds` | 机器人停了很久再恢复时，超过 5 分钟的旧消息不回复（0 = 不限） |
@@ -71,10 +73,11 @@ services:
 | 开关 | 做什么 |
 |---|---|
 | 接听语音电话 `call_enable` | 见下文「语音通话」，需要豆包 API Key |
+| 掉线推送 `notify_pushplus_token` | 填 [PushPlus](https://www.pushplus.plus) 的 token 后：掉线要扫码时把二维码推到手机、要手机确认时提醒、重新上线再推一条（同类 10 分钟最多一条） |
 
-始终生效的基础能力：私聊/群聊收发；@ 与引用（收到的 @，包括 @别人，会转成带 wxid 的 At；被引用的图片也会带上）；收图片、语音，发图片、语音、视频、文件；微信没有合并转发，自动拆成普通消息按顺序发；优先用群昵称；`WeChatClient.avatar(wxid)` 取联系人头像。
+始终生效的基础能力：私聊/群聊收发；@ 与引用（收到的 @，包括 @别人，会转成带 wxid 的 At；被引用的图片也会带上）；收图片、语音、视频，发图片、语音、视频、文件；下载不下来的表情标成「[表情包]」；微信没有合并转发，自动拆成普通消息按顺序发；优先用群昵称；`WeChatClient.avatar(wxid)` 取联系人头像。
 
-**目前做不到的**（agent-wechat 本身不支持）：发送动态表情（GIF 会变成静态图）、大部分群友表情下载不了、拍一拍、群语音通话、视频通话。
+**目前做不到的**（agent-wechat 本身不支持）：发送动态表情（GIF 会变成静态图）、大部分群友表情下载不了、发图不压缩（每张图压到 64KB，大图只能另发文件）、拍一拍、转账红包、朋友圈、群语音通话、视频通话。
 
 ## 语音通话
 
@@ -116,6 +119,9 @@ services:
 | `attach_recent_image` / `recent_image_seconds` | `true` / `180` | 先发图再 @ 时带上图、时限 |
 | `parse_share_card` | `true` | 分享卡片 / 聊天记录转文字 |
 | `split_long_voice` | `true` | 长语音自动切段 |
+| `watch_video` | `true` | 看视频（群里只在被 @ / 引用 / 正在聊时看） |
+| `send_image_original` | `true` | 大图附原图文件 |
+| `notify_pushplus_token` | 空 | 掉线推送用的 PushPlus token，留空不推 |
 | `call_enable` | `false` | 接听微信语音来电 |
 | `call_allow` | `[]` | 允许接听的来电 wxid，其他人自动拒接；填 `*` = 所有好友 |
 | `call_voice` | `zh_female_xiaohe_jupiter_bigtts` | 豆包音色（小何 2.0） |
