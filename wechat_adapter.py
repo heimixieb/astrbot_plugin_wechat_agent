@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import random
 import re
+import smtplib
 import time
 import uuid
 from collections import deque
 from datetime import datetime
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,6 @@ LOGIN_QR_FILE = "login_qr.png"
 # 登录操作的结束状态（和 wx auth login 一致）
 LOGIN_GRACE_SECONDS = 45  # 发现没登录后先等这么久，让守护进程自己重连
 LOGIN_DONE = {"succeeded", "failed", "cancelled", "expired", "rejected", "needs_login", "approval_required", "challenge_required"}
-PUSHPLUS_URL = "https://www.pushplus.plus/send"
 NOTIFY_GAP_SECONDS = 600  # 同一类「要你动手」的推送（扫码 / 手机确认）最多 10 分钟一条
 
 DEFAULT_CONFIG = {
@@ -85,7 +85,9 @@ DEFAULT_CONFIG = {
     "parse_share_card": True,  # 分享卡片 / 聊天记录转文字
     "watch_video": True,  # 被 @ 时看引用的 / 刚发的视频，私聊视频直接看
     "send_image_original": True,  # 大图另附一份原图文件（守护进程发图会压到 64KB）
-    "notify_pushplus_token": "",  # 掉线时推送到手机（PushPlus token，留空 = 不推）
+    "notify_email": "",  # 掉线时发邮件提醒（自己发给自己的邮箱，留空 = 不发）
+    "notify_email_code": "",  # 邮箱的 SMTP 授权码（不是登录密码）
+    "notify_smtp": "smtp.qq.com:465",  # SMTP 服务器（SSL）
     "split_long_voice": True,  # 超过 55 秒的语音切成几条
     "call_enable": False,  # 微信语音来电 → 豆包实时语音（需守护进程 ≥1.4.0、环境变量 DOUBAO_REALTIME_API_KEY）
     "call_allow": [],  # 允许接听的来电 wxid；填 "*" = 所有好友
@@ -131,8 +133,12 @@ CONFIG_METADATA = {
                     "hint": "私聊发来的视频直接交给机器人看；群里只在有人 @ 机器人并引用视频、或发完视频不久就 @ 机器人时才看（看视频要抽帧识别，比较费钱）。其余群视频只告诉机器人「[视频]」。需要能理解视频的插件（如 face_convert）。"},
     "send_image_original": {"description": "大图附原图文件", "type": "bool",
                             "hint": "守护进程发图会把每张图压到 64KB 以内（大图会糊）。打开后，长边 ≥1600 的静态大图（比如 AI 画的图）在正常发图之后再发一份原图文件，想看高清的点文件。"},
-    "notify_pushplus_token": {"description": "掉线推送（PushPlus token）", "type": "string", "secret": True,
-                              "hint": "微信掉线、需要扫码/确认、重新上线时，通过 PushPlus（pushplus.plus，关注公众号即可拿 token）推送到手机，扫码时连二维码一起推。留空不推。"},
+    "notify_email": {"description": "掉线提醒邮箱", "type": "string",
+                     "hint": "微信掉线要扫码、要手机确认、重新上线时，用这个邮箱给自己发一封提醒，扫码时二维码就在邮件正文里。留空不发。"},
+    "notify_email_code": {"description": "邮箱授权码", "type": "string", "secret": True,
+                          "hint": "邮箱的 SMTP 授权码，不是登录密码。QQ 邮箱：网页版「设置 → 账号」里开启 POP3/SMTP 服务后生成。"},
+    "notify_smtp": {"description": "SMTP 服务器", "type": "string",
+                    "hint": "「地址:端口」，走 SSL。QQ 邮箱 smtp.qq.com:465，163 邮箱 smtp.163.com:465。"},
     "split_long_voice": {"description": "长语音自动切段", "type": "bool",
                          "hint": "微信语音最长 60 秒，超过 55 秒的按换气停顿切成几条发。关掉后超长语音会发送失败。"},
     "call_enable": {"description": "接听语音电话", "type": "bool",
@@ -186,7 +192,9 @@ class WeChatAgentAdapter(Platform):
         self.parse_share_card = bool(cfg.get("parse_share_card", True))
         self.watch_video = bool(cfg.get("watch_video", True))
         self.send_image_original = bool(cfg.get("send_image_original", True))
-        self.notify_token = str(cfg.get("notify_pushplus_token") or "").strip()
+        self.notify_email = str(cfg.get("notify_email") or "").strip()
+        self.notify_email_code = str(cfg.get("notify_email_code") or "").strip()
+        self.notify_smtp = str(cfg.get("notify_smtp") or DEFAULT_CONFIG["notify_smtp"]).strip()
         self.split_long_voice = bool(cfg.get("split_long_voice", True))
         self._send_lock = asyncio.Lock()
         self._last_send = 0.0
@@ -219,7 +227,6 @@ class WeChatAgentAdapter(Platform):
         # 群里每人最近发的一个视频（原消息, 时间）：不先下载，等他 @ 机器人时才下载来看
         self._recent_video: dict[tuple[str, str], tuple[dict, float]] = {}
         # 掉线推送：掉线原因、这次掉线是否推过、上次推二维码 / 手机确认的时间
-        self.notify_url = PUSHPLUS_URL
         self._outage_reason = ""
         self._outage_notified = False
         self._last_push = {"qr": -NOTIFY_GAP_SECONDS, "approval": -NOTIFY_GAP_SECONDS}
@@ -368,13 +375,13 @@ class WeChatAgentAdapter(Platform):
                 art = "\n" + qr_text(mods) if mods else ""
                 logger.warning(f"[wechat_agent] 微信未登录，请用手机微信扫下面的二维码（约 2 分钟换一张），图片也存在 {qr_path}{art}")
                 if self._push_due("qr"):
-                    img = base64.b64encode(png).decode()
                     await self._notify(
                         "微信掉线了，请扫码登录",
                         f"<p>{self._outage_reason or '微信没登录'}。</p>"
                         "<p>用机器人那个微信号的手机扫下面的二维码，扫完在手机上点「登录」。"
-                        "二维码约 2 分钟换一张，过期了等下一条推送（最多 10 分钟一条）。</p>"
-                        f'<p><img src="data:image/png;base64,{img}" style="width:260px"></p>',
+                        "二维码约 2 分钟换一张，过期了等下一封（最多 10 分钟一封）。</p>"
+                        '<p><img src="cid:qr" style="width:260px"></p>',
+                        image=png,
                     )
             if state == "awaiting_approval" and not approval:
                 logger.warning("[wechat_agent] 已扫码，请在手机微信上点「登录」确认")
@@ -406,25 +413,37 @@ class WeChatAgentAdapter(Platform):
 
     def _push_due(self, kind: str) -> bool:
         """这一类推送离上次够 10 分钟了没有；够了就记下这次的时间。"""
-        if not self.notify_token or time.monotonic() - self._last_push[kind] < NOTIFY_GAP_SECONDS:
+        if not self._notify_on() or time.monotonic() - self._last_push[kind] < NOTIFY_GAP_SECONDS:
             return False
         self._last_push[kind] = time.monotonic()
         return True
 
-    async def _notify(self, title: str, html: str) -> None:
-        """掉线相关的事推送到手机（PushPlus）。没配 token 就不推；推送失败只记日志，不影响登录。"""
-        if not self.notify_token:
+    def _notify_on(self) -> bool:
+        return bool(self.notify_email and self.notify_email_code)
+
+    async def _notify(self, title: str, html: str, image: bytes | None = None) -> None:
+        """掉线相关的事发邮件给自己（二维码嵌在正文里）。没配邮箱就不发；发送失败只记日志，不影响登录。"""
+        if not self._notify_on():
             return
         self._outage_notified = True
-        body = {"token": self.notify_token, "title": f"[{self.metadata.id}] {title}", "content": html, "template": "html"}
+        mail = EmailMessage()
+        mail["Subject"] = f"[{self.metadata.id}] {title}"
+        mail["From"] = mail["To"] = self.notify_email
+        mail.set_content("请用支持 HTML 的邮件客户端查看。")
+        mail.add_alternative(html, subtype="html")
+        if image:
+            mail.get_payload()[1].add_related(image, "image", "png", cid="<qr>")
+        host, _, port = self.notify_smtp.partition(":")
+
+        def send() -> None:
+            with smtplib.SMTP_SSL(host, int(port or 465), timeout=20) as s:
+                s.login(self.notify_email, self.notify_email_code)
+                s.send_message(mail)
+
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(self.notify_url, json=body, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    data = await r.json(content_type=None)
-            if not isinstance(data, dict) or data.get("code") != 200:
-                logger.warning(f"[wechat_agent] 掉线推送没成功: {str(data)[:200]}")
+            await asyncio.to_thread(send)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[wechat_agent] 掉线推送失败: {type(e).__name__}: {e}")
+            logger.warning(f"[wechat_agent] 掉线提醒邮件发送失败: {type(e).__name__}: {e}")
 
     def _load_cursor(self) -> str:
         try:

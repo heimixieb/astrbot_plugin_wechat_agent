@@ -73,7 +73,7 @@ services:
 | 开关 | 做什么 |
 |---|---|
 | 接听语音电话 `call_enable` | 见下文「语音通话」，需要豆包 API Key |
-| 掉线推送 `notify_pushplus_token` | 填 [PushPlus](https://www.pushplus.plus) 的 token 后：掉线要扫码时把二维码推到手机、要手机确认时提醒、重新上线再推一条（同类 10 分钟最多一条） |
+| 掉线邮件提醒 `notify_email` / `notify_email_code` | 填邮箱和它的 SMTP 授权码（QQ 邮箱：网页版「设置 → 账号」开启 POP3/SMTP 服务后生成）后：掉线要扫码时把二维码发到邮箱（就在正文里）、要手机确认时提醒、重新上线再发一封（同类 10 分钟最多一封）。完全免费 |
 
 始终生效的基础能力：私聊/群聊收发；@ 与引用（收到的 @，包括 @别人，会转成带 wxid 的 At；被引用的图片也会带上）；收图片、语音、视频，发图片、语音、视频、文件；下载不下来的表情标成「[表情包]」；微信没有合并转发，自动拆成普通消息按顺序发；优先用群昵称；`WeChatClient.avatar(wxid)` 取联系人头像。
 
@@ -121,7 +121,8 @@ services:
 | `split_long_voice` | `true` | 长语音自动切段 |
 | `watch_video` | `true` | 看视频（群里只在被 @ / 引用 / 正在聊时看） |
 | `send_image_original` | `true` | 大图附原图文件 |
-| `notify_pushplus_token` | 空 | 掉线推送用的 PushPlus token，留空不推 |
+| `notify_email` / `notify_email_code` | 空 / 空 | 掉线提醒发给哪个邮箱（自己发给自己）、它的 SMTP 授权码；留空不发 |
+| `notify_smtp` | `smtp.qq.com:465` | SMTP 服务器（SSL），163 邮箱填 `smtp.163.com:465` |
 | `call_enable` | `false` | 接听微信语音来电 |
 | `call_allow` | `[]` | 允许接听的来电 wxid，其他人自动拒接；填 `*` = 所有好友 |
 | `call_voice` | `zh_female_xiaohe_jupiter_bigtts` | 豆包音色（小何 2.0） |

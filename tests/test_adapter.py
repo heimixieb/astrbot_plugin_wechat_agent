@@ -517,42 +517,74 @@ class OriginalImageFileTest(Base):
         self.assertEqual([s["kind"] for s in self.d.sends], ["image", "image"])
 
 
+class FakeSMTP:
+    sent: list = []
+    logins: list = []
+
+    def __init__(self, host, port, timeout=None):
+        self.addr = (host, port)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def login(self, user, code):
+        FakeSMTP.logins.append((self.addr, user, code))
+
+    def send_message(self, mail):
+        FakeSMTP.sent.append(mail)
+
+
 class NotifyTest(Base):
     async def asyncSetUp(self):
         await super().asyncSetUp()
+        from unittest.mock import patch
 
         async def no_sleep(_):
             return None
         self.a._sleep = no_sleep
-        self.a.notify_token = "tok"
-        self.a.notify_url = f"http://127.0.0.1:{self.d.port}/pushplus"
+        self.a.notify_email, self.a.notify_email_code = "me@qq.com", "authcode"
+        FakeSMTP.sent, FakeSMTP.logins = [], []
+        p = patch("astrbot_plugin_wechat_agent.wechat_adapter.smtplib.SMTP_SSL", FakeSMTP)
+        p.start()
+        self.addCleanup(p.stop)
         self.d.authenticated = False
 
-    async def test_qr_push_then_back_online(self):
+    def subjects(self):
+        return [m["Subject"] for m in FakeSMTP.sent]
+
+    async def test_qr_mail_then_back_online(self):
         self.d.qr_png = qr_png(fake_modules())
         self.d.login_states = ["awaiting_approval", "succeeded"]
         self.a._outage_reason = "微信登录掉了（服务码 -13）"
         await self.a._login()
-        titles = [p["title"] for p in self.d.pushes]
-        self.assertEqual(titles, ["[wechat] 微信掉线了，请扫码登录", "[wechat] 微信重新上线了"])  # 扫码后的确认不再推
-        self.assertIn("服务码 -13", self.d.pushes[0]["content"])
-        self.assertIn("data:image/png;base64,", self.d.pushes[0]["content"])
-        self.assertEqual(self.d.pushes[0]["token"], "tok")
+        self.assertEqual(self.subjects(), ["[wechat] 微信掉线了，请扫码登录", "[wechat] 微信重新上线了"])  # 扫码后的确认不再发
+        mail = FakeSMTP.sent[0]
+        self.assertEqual((mail["From"], mail["To"]), ("me@qq.com", "me@qq.com"))
+        html = mail.get_body(("html",))
+        self.assertIn("服务码 -13", html.get_content())
+        self.assertIn('src="cid:qr"', html.get_content())
+        qr = next(p for p in mail.walk() if p.get_content_type() == "image/png")
+        self.assertEqual(qr["Content-ID"], "<qr>")
+        self.assertEqual(qr.get_content(), self.d.qr_png)  # 二维码原图嵌在邮件里
+        self.assertEqual(FakeSMTP.logins[0], (("smtp.qq.com", 465), "me@qq.com", "authcode"))
 
-    async def test_phone_approval_push_and_rate_limit(self):
+    async def test_phone_approval_mail_and_rate_limit(self):
         self.d.qr_available = False
         self.d.login_states = ["awaiting_approval", "failed"]
         await self.a._login()
         self.d.login_states = ["awaiting_approval", "failed"]
-        await self.a._login()  # 10 分钟内同类不重复推
-        self.assertEqual([p["title"] for p in self.d.pushes], ["[wechat] 微信要你在手机上确认登录"])
+        await self.a._login()  # 10 分钟内同类不重复发
+        self.assertEqual(self.subjects(), ["[wechat] 微信要你在手机上确认登录"])
 
-    async def test_no_token_no_push(self):
-        self.a.notify_token = ""
+    async def test_no_email_no_mail(self):
+        self.a.notify_email_code = ""
         self.d.qr_png = qr_png(fake_modules())
         self.d.login_states = ["succeeded"]
         await self.a._login()
-        self.assertEqual(self.d.pushes, [])
+        self.assertEqual(FakeSMTP.sent, [])
 
 
 class QuoteProbabilityTest(Base):

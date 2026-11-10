@@ -37,7 +37,6 @@ class FakeDaemon:
         self.qr_png = b""
         self.qr_fetches: list[str] = []
         self.qr_available = True  # False = 免扫码登录，直接等手机确认
-        self.pushes: list[dict] = []  # 收到的 PushPlus 推送
         self.runner = None
         self.port = 0
 
@@ -68,12 +67,11 @@ class FakeDaemon:
         r.add_get(f"/v1/accounts/{ACC}/groups/{{gid}}/lookup", self.lookup_group)
         r.add_get(f"/v1/accounts/{ACC}/avatars/{{uid}}", self.avatar)
         r.add_post(f"/v1/accounts/{ACC}/avatars/{{uid}}/refresh", self.avatar_refresh)
-        r.add_post("/pushplus", self.pushplus)
         return app
 
     @web.middleware
     async def auth(self, request, handler):
-        if request.path != "/pushplus" and request.headers.get("Authorization") != f"Bearer {TOKEN}":
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
             return web.json_response({"error": {"code": "unauthorized"}}, status=401)
         return await handler(request)
 
@@ -105,11 +103,6 @@ class FakeDaemon:
             self.authenticated = True
         return web.json_response({"id": req.match_info["oid"], "kind": "login", "state": state,
                                   "result": {"qrAvailable": self.qr_available, "qrGeneration": 1}})
-
-    async def pushplus(self, req):
-        self.pushes.append(await req.json())
-        return web.json_response({"code": 200, "msg": "ok"})
-
     async def qr(self, req):
         self.qr_fetches.append(req.query.get("generation", ""))
         return web.Response(body=self.qr_png, content_type="image/png")
